@@ -20,3 +20,10 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+
+pip install -r requirements.txt
+streamlit run app.py
+docker build -t onboarding-phase1 .
+docker run --rm -p 8501:8501 \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  onboarding-phase1
