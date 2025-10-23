@@ -6,3 +6,6 @@ langchain-ollama==0.1.1
 ollama
 pypdf==5.1.0
 python-docx==1.1.2
+beautifulsoup4==4.12.3
+lxml==5.3.0
+httpx==0.27.2
