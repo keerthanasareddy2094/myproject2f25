@@ -1,0 +1,8 @@
+streamlit==1.38.0
+pandas==2.2.2
+langchain==0.2.16
+langchain-core==0.2.38
+langchain-ollama==0.1.1
+ollama
+pypdf==5.1.0
+python-docx==1.1.2
