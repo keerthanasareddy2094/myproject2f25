@@ -7,7 +7,7 @@ from pypdf import PdfReader
 from docx import Document
 
 # ===== CONFIG =====
-APP_TITLE = "Internship Onboarding – Phase 1"
+APP_TITLE = "Internship Onboarding – Phase 1 (+ Deep Discovery)"
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -18,7 +18,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
 if Path("styles.css").exists():
     st.markdown(Path("styles.css").read_text(), unsafe_allow_html=True)
 st.title(APP_TITLE)
-st.caption("We’ll ask up to 10 short questions to understand your goals and background.")
+st.caption("We’ll ask up to 10 questions to understand your goals. Then you can run **Deep Discovery** to collect internship links.")
 
 # ===== LLM HELPERS =====
 @st.cache_resource(show_spinner=False)
@@ -45,17 +45,18 @@ def _ollama_chat(msgs: List[Dict], num_predict=160, temp=0.2) -> str:
         return ""
 
 # ===== RESUME UTILITIES =====
+from io import BytesIO
 def _read_pdf(b: bytes) -> str:
     text=[]
     try:
-        pdf=PdfReader(io.BytesIO(b))
+        pdf=PdfReader(BytesIO(b))
         for p in pdf.pages: text.append(p.extract_text() or "")
     except: pass
     return "\n".join(text)
 
 def _read_docx(b: bytes) -> str:
     try:
-        doc=Document(io.BytesIO(b))
+        doc=Document(BytesIO(b))
         return "\n".join(p.text for p in doc.paragraphs)
     except: return ""
 
@@ -68,7 +69,7 @@ def _resume_text(file) -> str:
 
 def _llm_resume_json(text:str)->Dict:
     if not text.strip(): return {}
-    sys=("You are a résumé parser. Return ONLY compact JSON with keys:"
+    sys=("You are a résumé parser. Return ONLY compact JSON (no prose): "
          '{"name":"","email":"","phone":"","skills":[],"education":[],"experience":[]}')
     out=_ollama_chat([{"role":"system","content":sys},
                       {"role":"user","content":text[:8000]}],num_predict=300,temp=0.1)
@@ -91,9 +92,9 @@ BASE_Q=[
 ]
 
 def _llm_next_q(hist:List[Dict],remain:int)->str:
-    sys=("You ask at most 10 short questions to understand a student’s internship goals. "
-         "Cover roles, companies, location, skills, work mode, timeline, visa, industries, and final comments. "
-         "Return one concise question only.")
+    sys=("Ask at most 10 short questions to understand internship goals. "
+         "Cover roles, companies, location, skills, work mode, timeline, authorization, industries, final notes. "
+         "Return one question only.")
     convo="\n".join([f"Q:{h['q']}\nA:{h['a']}" for h in hist])
     out=_ollama_chat([
         {"role":"system","content":sys},
@@ -156,6 +157,7 @@ with st.sidebar:
         txt=_resume_text(up)
         js=_llm_resume_json(txt) if st.session_state.have_llm else {}
         st.session_state.profile["resume"]=js
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
         (DATA_DIR/"resume.txt").write_text(txt)
         (DATA_DIR/"resume.json").write_text(json.dumps(js,indent=2))
         st.success("Résumé uploaded ✅")
@@ -170,17 +172,49 @@ if st.session_state.done:
         data=json.dumps(prof,indent=2).encode(),
         file_name="student_profile.json",
         mime="application/json")
+
+    st.markdown("---")
+    st.subheader("🔎 Deep Discovery (optional)")
+    st.caption("Collect internship links now using your answers. Static discovery (requests+bs4). For JS-heavy sites, set env `USE_PLAYWRIGHT=1`.")
+    max_pages = st.slider("Max pages per company", 10, 80, 40, 10)
+
+    if st.button("Run Deep Discovery"):
+        with st.spinner("Discovering…"):
+            from search import discover_from_profile_sync
+            res = discover_from_profile_sync(prof, max_pages_per_company=max_pages)
+        # Render results
+        csusb = res.get("csusb_links", [])
+        st.write(f"**CSUSB internship/career links**: {len(csusb)}")
+        if csusb:
+            st.dataframe(csusb, use_container_width=True, hide_index=True)
+
+        comps = res.get("companies", [])
+        total = sum(len(c.get("postings", [])) for c in comps)
+        st.write(f"**Deep company results**: {total} postings across {len(comps)} companies")
+        for c in comps:
+            st.markdown(f"### {c['company']} — {len(c.get('postings',[]))} postings")
+            if c.get("postings"):
+                st.dataframe(c["postings"], use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "📥 Download Discovery JSON",
+            data=json.dumps(res, indent=2).encode(),
+            file_name="discovery_results.json",
+            mime="application/json"
+        )
+
     if st.button("🔁 Restart"):
         for k in ["q_i","hist","done"]:
             st.session_state[k]=0 if k=="q_i" else ([] if k=="hist" else False)
         st.session_state.profile={k:v for k,v in st.session_state.profile.items()}
         st.session_state.profile.update({"resume":{}})
         st.rerun()
+
 else:
     remain=MAX_QUESTIONS-st.session_state.q_i
     if remain<=0:
         st.session_state.done=True; st.rerun()
-    q=_llm_next_q(st.session_state.hist,remain) if st.session_state.have_llm else ""
+    q=_ollama_ok() and _llm_next_q(st.session_state.hist,remain) or ""
     if not q: q=BASE_Q[min(st.session_state.q_i,len(BASE_Q)-1)]
     st.subheader(f"Question {st.session_state.q_i+1} of {MAX_QUESTIONS}")
     st.write(q)
