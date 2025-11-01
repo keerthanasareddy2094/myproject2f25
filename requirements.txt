@@ -1,10 +1,9 @@
 streamlit
 pandas
+beautifulsoup4
+lxml
+requests
+playwright
 pypdf
 python-docx
 httpx
-beautifulsoup4
-lxml
-playwright
-langchain
-langchain-ollama
