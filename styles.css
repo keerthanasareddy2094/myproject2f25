@@ -1,13 +1,6 @@
-:root{
-  --bg:#f8fafc; --text:#111827; --panel:#ffffff;
-}
-html,body,[data-testid="stAppViewContainer"]{
-  background:var(--bg)!important; color:var(--text)!important;
-  font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;
+body,[data-testid="stAppViewContainer"]{
+  font-family:Inter,system-ui,sans-serif;
+  background:#f8fafc;
+  color:#111827;
 }
 #MainMenu,footer{visibility:hidden}
-[data-testid="stSidebar"]>div{
-  background:var(--panel)!important;border-radius:16px;border:1px solid #e5e7eb
-}
-[data-testid="stChatInput"]{position:sticky;bottom:16px;background:#fff;
-border:1px solid #e5e7eb;border-radius:12px}
