@@ -19,7 +19,7 @@ Follow these steps to get the application running on your local machine.
 Because the local repository can't been updated correctly, need to remove the directory first.
 
 ```bash
-rm -rf team2f25
+rm -rf myproject2f25
 ```
 
 ### Step 2: Clone the Repository
@@ -27,7 +27,7 @@ rm -rf team2f25
 Clone the GitHub repository to your local machine:
 
 ```bash
-git clone https://github.com/DrAlzahrani2025Projects/team2f25.git
+git clone https://github.com/keerthanasareddy2094/myproject2f25.git
 ```
 
 ### Step 3: Navigate to the Repository
@@ -35,7 +35,7 @@ git clone https://github.com/DrAlzahrani2025Projects/team2f25.git
 Change to the cloned repository directory:
 
 ```bash
-cd team2f25
+cd myproject2f25
 ```
 
 ### Step 4: Pull the Latest Version
@@ -92,4 +92,5 @@ For Streamlit:
 Open browser at https://sec.cse.csusb.edu/team2f25 
 
 ## Google Colab Notebook  
-[Open in Colab](https://colab.research.google.com/drive/1icOiUzhhm0l7PkDoCxUdDMqpX1eua8ug?usp=sharing)
+https://colab.research.google.com/drive/1pZ3zJQlQ5-bCKQ0EvRE2pi1-TgFhRHi8#scrollTo=QTBTGxMFb04s
+
