@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   ollama:
     image: ollama/ollama:latest
@@ -8,11 +6,14 @@ services:
       - "11434:11434"
     volumes:
       - ollama:/root/.ollama
+    # More reliable healthcheck (no curl needed)
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
-      retries: 20
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
 
   app:
     build: .
@@ -20,6 +21,7 @@ services:
     ports:
       - "8501:8501"
     environment:
+      # App talks to the Ollama service by DNS name ("ollama")
       - OLLAMA_HOST=http://ollama:11434
       - MODEL_NAME=qwen2:0.5b
       - NUM_CTX=2048
@@ -28,9 +30,7 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-    # Uncomment if you want to see Playwright browser output for debugging:
-    # stdin_open: true
-    # tty: true
+    restart: unless-stopped
 
 volumes:
   ollama:
