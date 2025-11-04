@@ -1,4 +1,3 @@
-# auto_apply.py — Greenhouse/Lever auto-apply helper
 import asyncio, os, tempfile
 from typing import Dict, List
 from playwright.async_api import async_playwright
