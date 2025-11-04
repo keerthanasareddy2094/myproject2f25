@@ -1,16 +1,25 @@
 # app.py — CSUSB Internship Assistant (full app)
 # Features:
-#  - Greeting + general chat (Ollama optional)
+#  - Greeting + general chat (works without LLM via rule-based answers; richer with Ollama)
 #  - List CSUSB internships (scraper)
-#  - Apply flow: ask details, resume upload, extract profile, rank matches
-#  - Generate Application Kits (email, cover, ATS keywords, bullets)
-#  - Auto-Apply (beta) for Greenhouse/Lever via Playwright (auto_apply.py)
+#  - Apply flow:
+#      * Phase 1: short questionnaire (up to 10 Qs)
+#      * Phase 2: résumé upload, profile extraction, ranking, Application Kits
+#      * Auto-Apply (beta) for Greenhouse/Lever via Playwright
+#
+# Place this file at repo root. Keep auto_apply.py (underscore) in the same folder.
 
-import os, re, io, requests, pandas as pd, streamlit as st, nest_asyncio, asyncio
+import os, re, io, json, urllib.request, requests, pandas as pd, streamlit as st, nest_asyncio, asyncio
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from bs4 import BeautifulSoup
-from auto_apply import auto_apply_batch
+
+# ---- Optional Auto-Apply (Greenhouse/Lever). Hide if helper missing.
+AUTO_APPLY_AVAILABLE = True
+try:
+    from auto_apply import auto_apply_batch
+except Exception:
+    AUTO_APPLY_AVAILABLE = False
 
 nest_asyncio.apply()
 
@@ -23,17 +32,61 @@ SYS       = os.getenv("SYSTEM_PROMPT", "You are a helpful, concise assistant.")
 MAX_TOK   = int(os.getenv("MAX_TOKENS", "256"))
 NUM_CTX   = int(os.getenv("NUM_CTX", "2048"))
 
-# -------------------- Utils --------------------
+# -------------------- Helpers --------------------
+def ollama_ready(host: str) -> bool:
+    try:
+        with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+_SIMPLE_QA = {
+    r"\b(hi|hello|hey)\b": "Hi! I’m the CSUSB Internship Assistant. I can list internships, answer quick questions, and help you apply.",
+    r"\b(who are you|your name)\b": "I’m the CSUSB Internship Assistant. I help you find and apply to internships.",
+    r"\b(what can you do|help|capabilities)\b": "I can: (1) list internships from the CSUSB page, (2) guide you to apply, (3) draft emails/ATS keywords, and (4) auto-fill Greenhouse/Lever forms.",
+    r"\b(how (do|to) apply|apply steps)\b": "Say “apply for internships”. I’ll ask a few questions, read your résumé (optional), then show matches and generate application materials.",
+    r"\b(internship tips|resume tips|cv tips|cover letter)\b": "Keep bullets concise and quantified, mirror keywords from the posting, and keep cover letters to ~120 words.",
+}
+def rule_based_answer(user: str) -> str:
+    s = (user or "").lower().strip()
+    for pat, ans in _SIMPLE_QA.items():
+        if re.search(pat, s):
+            return ans
+    if "intern" in s:
+        return "Say “internships” to list CSUSB postings, or “apply for internships” to start a short questionnaire."
+    return "I can list internships, answer quick questions, and help you apply. Try “internships” or “apply for internships”."
+
+# Interview (Phase-1)
+INTERVIEW_QUESTIONS = [
+    ("role",       "What roles are you targeting? (e.g., software, data, security)"),
+    ("skills",     "List your top 5–8 skills (comma-separated)."),
+    ("company",    "Any preferred companies? (optional)"),
+    ("location",   "Preferred location(s)? (optional)"),
+    ("remote",     "Remote type preference? (any/remote/hybrid/onsite)"),
+    ("exp",        "Rough years of experience (0/0.5/1/2…)? (optional)"),
+    ("courses",    "Relevant courses or projects? (optional, comma-separated)"),
+    ("clearance",  "Do you hold any work authorization or clearance? (optional)"),
+    ("availability","When can you start? (e.g., immediately, Jan 2026)"),
+    ("extras",     "Anything else you want us to prioritize? (optional)"),
+]
+def merge_interview_into_profile(answers: dict) -> dict:
+    roles = [w.strip() for w in (answers.get("role") or "").split(",") if w.strip()]
+    skills = [w.strip() for w in (answers.get("skills") or "").split(",") if w.strip()]
+    try:
+        exp_years = float((answers.get("exp") or "").replace("+","").strip())
+    except Exception:
+        exp_years = None
+    return {"roles": roles, "skills": skills, "exp_years": exp_years}
+
+# -------------------- Scraper (CSUSB page) --------------------
 BAD_LAST = {"careers","career","jobs","job","students","graduates","early-careers"}
 JUNK_KEYWORDS = {
     "proposal form","evaluation form","student evaluation","supervisor evaluation",
     "report form","handbook","resume","cv","scholarship","scholarships","grant program",
     "career center","advising","policy","forms","pdf"
 }
-
 def _clean(s:str)->str:
     return re.sub(r"\s+"," ", (s or "")).strip()
-
 def _path_is_specific(path:str)->bool:
     p = (path or "/").lower()
     if "intern" in p or "co-op" in p: return True
@@ -41,18 +94,15 @@ def _path_is_specific(path:str)->bool:
     if any(re.search(r"\d{5,}", s) for s in seg): return True
     if seg and seg[-1] in BAD_LAST: return False
     return len(seg) >= 3
-
 def _is_intern_link(text, url)->bool:
     low = f"{text} {url}".lower()
     if any(k in low for k in JUNK_KEYWORDS): return False
     if not ("intern" in low or "co-op" in low): return False
     try: return _path_is_specific(urlparse(url).path)
     except Exception: return False
-
 def _canon(s: str) -> str:
     return re.sub(r"[^a-z0-9]","",(s or "").lower())
 
-# -------------------- Scraper (CSUSB page only) --------------------
 @st.cache_data(ttl=60*30, show_spinner=False)
 def scrape_csusb() -> pd.DataFrame:
     r = requests.get(CSUSB_URL, headers={"User-Agent": UA}, timeout=20)
@@ -207,6 +257,10 @@ for k, v in {
     "applicant_info": None,
     "profile": None,
     "ranked_rows": None,
+    "llm_ready": ollama_ready(OLLAMA),
+    "interview_active": False,
+    "interview_idx": 0,
+    "interview_answers": {},
 }.items():
     if k not in st.session_state: st.session_state[k] = v
 
@@ -217,14 +271,26 @@ if st.session_state["mode"] == "greet":
     if not user:
         st.stop()
     txt = user.lower()
-    if re.search(r"\b(apply|find|match)\b.*\b(intern)", txt):
-        st.session_state["mode"] = "apply"; st.rerun()
-    elif re.search(r"\b(intern|internship|show internships|list internships)\b", txt):
+
+    # Route: Apply (interview first)
+    if re.search(r"\b(apply|application|apply for)\b.*\b(intern|internship)", txt) or txt.strip() in {"apply", "apply for internships"}:
+        st.session_state["interview_active"] = True
+        st.session_state["interview_idx"] = 0
+        st.session_state["interview_answers"] = {}
+        st.session_state["mode"] = "apply"
+        st.rerun()
+
+    # Route: list internships
+    if re.search(r"\b(intern|internship|show internships|list internships)\b", txt):
         st.session_state["mode"] = "list"; st.rerun()
+
+    # General chat
+    if st.session_state["llm_ready"]:
+        ans = llm_answer(user) or rule_based_answer(user)
     else:
-        ans = llm_answer(user) or "(LLM unavailable — enable/pair Ollama for richer answers.)"
-        st.markdown("**Assistant:** " + ans)
-        st.stop()
+        ans = rule_based_answer(user)
+    st.markdown("**Assistant:** " + ans)
+    st.stop()
 
 # 2) List internships (CSUSB)
 if st.session_state["mode"] == "list":
@@ -238,8 +304,34 @@ if st.session_state["mode"] == "list":
     if st.button("Back ↩️"):
         st.session_state["mode"]="greet"; st.rerun()
 
-# 3) Apply flow (form → results → kits → auto-apply)
+# 3) Apply flow (Phase-1 interview → Phase-2 form/results/kits/auto-apply)
 if st.session_state["mode"] == "apply":
+    # --- Interview phase (if active) ---
+    if st.session_state.get("interview_active", False):
+        idx = st.session_state.get("interview_idx", 0)
+        if idx < len(INTERVIEW_QUESTIONS):
+            key, qtext = INTERVIEW_QUESTIONS[idx]
+            st.subheader("🧭 Internship Application – Quick Questions")
+            st.write(f"**{idx+1}/{len(INTERVIEW_QUESTIONS)}**  {qtext}")
+            ans = st.text_input("Your answer:", key=f"interview_{key}")
+            c1, c2 = st.columns(2)
+            if c1.button("Next ➡️"):
+                st.session_state["interview_answers"][key] = ans
+                st.session_state["interview_idx"] = idx + 1
+                st.rerun()
+            if c2.button("Skip"):
+                st.session_state["interview_answers"][key] = ""
+                st.session_state["interview_idx"] = idx + 1
+                st.rerun()
+            st.stop()
+        else:
+            # interview done → prefill profile for form
+            A = st.session_state.get("interview_answers", {})
+            prof_from_q = merge_interview_into_profile(A)
+            st.session_state["profile"] = prof_from_q
+            st.session_state["interview_active"] = False
+            st.success("Thanks! I used your answers to prefill your preferences below.")
+
     st.subheader("🧭 Personalized Internship Finder & Application")
 
     with st.form("apply_form", clear_on_submit=False):
@@ -250,24 +342,36 @@ if st.session_state["mode"] == "apply":
             phone = st.text_input("Phone")
         with c2:
             linkedin = st.text_input("LinkedIn URL")
-            location = st.text_input("Preferred location (optional)")
+            location = st.text_input("Preferred location (optional)",
+                                     value=(st.session_state.get("interview_answers", {}).get("location") or ""))
             remote   = st.selectbox("Remote type", ["Any","Remote","Hybrid","Onsite"], index=0)
 
-        role     = st.text_input("Desired role(s) (e.g., software, data, security)")
-        company  = st.text_input("Preferred company (optional)")
-        skills   = st.text_input("Top skills (comma-separated)")
-        resume   = st.file_uploader("Upload résumé (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
+        role_hint   = st.text_input("Desired role(s) (e.g., software, data, security)",
+                                    value=", ".join((st.session_state.get("profile") or {}).get("roles", [])))
+        company     = st.text_input("Preferred company (optional)",
+                                    value=(st.session_state.get("interview_answers", {}).get("company") or ""))
+        skills_hint = st.text_input("Top skills (comma-separated)",
+                                    value=", ".join((st.session_state.get("profile") or {}).get("skills", [])))
+        resume      = st.file_uploader("Upload résumé (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
 
         submitted = st.form_submit_button("Find Internships 🔍")
 
     if submitted:
         resume_text = extract_text_from_upload(resume)
-        profile = extract_profile(resume_text, role, skills)
+        base_prof = st.session_state.get("profile") or {"roles":[], "skills":[], "exp_years":None}
+        # merge resume extraction + hints
+        extracted = extract_profile(resume_text, role_hint, skills_hint)
+        merged = {
+            "roles": sorted(set((base_prof.get("roles") or []) + (extracted.get("roles") or []))),
+            "skills": sorted(set((base_prof.get("skills") or []) + (extracted.get("skills") or []))),
+            "exp_years": extracted.get("exp_years") or base_prof.get("exp_years"),
+        }
         with st.spinner("Searching CSUSB postings…"):
             df = scrape_csusb()
-        ranked = filter_and_rank(df, profile, company, location, remote) if not df.empty else pd.DataFrame()
+        ranked = filter_and_rank(df, merged, company, location, remote) if not df.empty else pd.DataFrame()
+
         st.session_state["applicant_info"] = {"name":name,"email":email,"phone":phone,"linkedin":linkedin}
-        st.session_state["profile"] = profile
+        st.session_state["profile"] = merged
         st.session_state["ranked_rows"] = [] if ranked.empty else ranked.to_dict("records")
         st.success("Results ready below. Select postings and click **Generate Application Kit**.")
 
@@ -303,46 +407,52 @@ if st.session_state["mode"] == "apply":
 
         # Auto-Apply (Greenhouse / Lever)
         st.markdown("---")
-        st.subheader("⚡ Auto-Apply (beta) — Greenhouse & Lever only")
-        st.caption("Fills common fields (name, email, phone, résumé, cover letter). Other portals will require manual apply.")
-        resume_for_auto = st.file_uploader("Upload résumé for auto-apply (PDF preferred)", type=["pdf"], key="resume_for_auto")
+        if AUTO_APPLY_AVAILABLE:
+            st.subheader("⚡ Auto-Apply (beta) — Greenhouse & Lever only")
+            st.caption("Fills common fields (name, email, phone, résumé, cover letter). Other portals will require manual apply.")
+            resume_for_auto = st.file_uploader("Upload résumé for auto-apply (PDF preferred)", type=["pdf"], key="resume_for_auto")
 
-        if st.button("Auto-apply to selected"):
-            picked = [r for i, r in enumerate(ranked_rows, start=1) if st.session_state.get(f"pick_{i}", False)]
-            if not picked:
-                st.warning("Select at least one internship above.")
-                st.stop()
-            if not resume_for_auto:
-                st.warning("Please upload your resume (PDF) for auto-apply.")
-                st.stop()
+            if st.button("Auto-apply to selected"):
+                picked = [r for i, r in enumerate(ranked_rows, start=1) if st.session_state.get(f"pick_{i}", False)]
+                if not picked:
+                    st.warning("Select at least one internship above.")
+                    st.stop()
+                if not resume_for_auto:
+                    st.warning("Please upload your resume (PDF) for auto-apply.")
+                    st.stop()
 
-            who = st.session_state.get("applicant_info") or {}
-            prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
-            cover = llm_answer(
-                f"Write a concise 6–8 line cover letter for internships. Roles={prof.get('roles')}, "
-                f"skills={prof.get('skills')}. Mention eagerness to learn and link to LinkedIn: {who.get('linkedin','')}.",
-                sys_msg="Professional, succinct tone."
-            ) or (
-                f"Dear Hiring Team,\n\n"
-                f"I am excited to apply for internship roles. My background includes {', '.join(prof.get('skills')[:6])} "
-                f"and interests in {', '.join(prof.get('roles')[:3])}. I am eager to contribute and learn.\n"
-                f"LinkedIn: {who.get('linkedin','')}\n\n"
-                f"Thank you for your consideration.\n"
-                f"{who.get('name','')}\n{who.get('email','')}\n{who.get('phone','')}"
-            )
+                who = st.session_state.get("applicant_info") or {}
+                prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
+                cover = llm_answer(
+                    f"Write a concise 6–8 line cover letter for internships. Roles={prof.get('roles')}, "
+                    f"skills={prof.get('skills')}. Mention eagerness to learn and link to LinkedIn: {who.get('linkedin','')}.",
+                    sys_msg="Professional, succinct tone."
+                ) or (
+                    f"Dear Hiring Team,\n\n"
+                    f"I am excited to apply for internship roles. My background includes {', '.join(prof.get('skills')[:6])} "
+                    f"and interests in {', '.join(prof.get('roles')[:3])}. I am eager to contribute and learn.\n"
+                    f"LinkedIn: {who.get('linkedin','')}\n\n"
+                    f"Thank you for your consideration.\n"
+                    f"{who.get('name','')}\n{who.get('email','')}\n{who.get('phone','')}"
+                )
 
-            with st.spinner("Submitting applications…"):
-                resume_bytes = resume_for_auto.read()
-                results = asyncio.run(auto_apply_batch(picked, who, resume_bytes, cover))
+                with st.spinner("Submitting applications…"):
+                    resume_bytes = resume_for_auto.read()
+                    try:
+                        results = asyncio.run(auto_apply_batch(picked, who, resume_bytes, cover))
+                    except Exception as e:
+                        results = [{"platform":"n/a","status":f"error: {e}","final_url":"n/a","title":"n/a","company":"n/a","url":"n/a"}]
 
-            st.success("Auto-apply finished. Review statuses below.")
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
-            st.markdown(
-                "Legend: **submitted_or_attempted** = form filled & submit click attempted • "
-                "**manual_required** = unsupported portal; open link and apply manually."
-            )
+                st.success("Auto-apply finished. Review statuses below.")
+                st.dataframe(pd.DataFrame(results), use_container_width=True)
+                st.markdown(
+                    "Legend: **submitted_or_attempted** = form filled & submit click attempted • "
+                    "**manual_required** = unsupported portal; open link and apply manually."
+                )
+        else:
+            st.info("Auto-Apply helper (auto_apply.py) not found—showing manual apply only. Add the file to enable this feature.")
 
     if st.button("Back ↩️"):
-        for k in ("applicant_info","profile","ranked_rows"):
-            st.session_state[k]=None
+        for k in ("applicant_info","profile","ranked_rows","interview_active","interview_idx","interview_answers"):
+            st.session_state[k]=None if k not in {"interview_active","interview_idx","interview_answers"} else (False if k=="interview_active" else (0 if k=="interview_idx" else {}))
         st.session_state["mode"]="greet"; st.rerun()
