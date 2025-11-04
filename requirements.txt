@@ -3,7 +3,10 @@ pandas
 beautifulsoup4
 lxml
 requests
-playwright
-pypdf
+pdfplumber
 python-docx
-httpx
+langchain
+langchain-ollama
+ollama
+nest_asyncio
+playwright
