@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    container_name: csusb-internship-assistant
+    ports:
+      - "8501:8501"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - MODEL_NAME=qwen2:0.5b
+      - NUM_CTX=2048
+      - MAX_TOKENS=256
+      - SYSTEM_PROMPT=Answer concisely (2–5 sentences).
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  ollama:
