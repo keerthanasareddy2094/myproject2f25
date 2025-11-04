@@ -28,6 +28,9 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    # Uncomment if you want to see Playwright browser output for debugging:
+    # stdin_open: true
+    # tty: true
 
 volumes:
   ollama:
