@@ -1,8 +1,11 @@
 services:
   ollama:
     image: ollama/ollama:latest
-    ports: ["11434:11434"]
-    volumes: [ "ollama:/root/.ollama" ]
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -13,7 +16,9 @@ services:
 
   app:
     build: .
-    ports: ["8501:8501"]
+    container_name: csusb-internship-assistant
+    ports:
+      - "8501:8501"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - MODEL_NAME=qwen2:0.5b
