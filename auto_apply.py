@@ -1,3 +1,4 @@
+# auto_apply.py — Greenhouse/Lever auto-apply (best effort)
 import asyncio, os, tempfile
 from typing import Dict, List
 from playwright.async_api import async_playwright
@@ -9,42 +10,51 @@ def _save_temp_file(file_or_bytes, suffix=".pdf") -> str:
         return ""
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
-    if hasattr(file_or_bytes, "read"):
-        data = file_or_bytes.read()
-    else:
-        data = file_or_bytes
+    data = file_or_bytes.read() if hasattr(file_or_bytes, "read") else file_or_bytes
     with open(path, "wb") as f:
         f.write(data)
     return path
 
 async def _apply_greenhouse(page, url: str, who: Dict, resume_path: str, cover_text: str) -> str:
     await page.goto(url, wait_until="domcontentloaded", timeout=COMMON_TIMEOUT)
+    # Upload resume
     for sel in ['input[name="resume"]','input[type="file"][name*="resume"]','input[type="file"]']:
         try:
             up = page.locator(sel)
             if await up.count():
                 await up.set_input_files(resume_path); break
         except: pass
+    # Basic fields
     fields = [
         ("first_name", ['input[name="first_name"]','input[name="firstName"]','input[name~="first"]']),
         ("last_name",  ['input[name="last_name"]','input[name="lastName"]','input[name~="last"]']),
         ("email",      ['input[type="email"]','input[name="email"]','input[name="email_address"]']),
         ("phone",      ['input[type="tel"]','input[name="phone"]','input[name="phone_number"]']),
     ]
+    names = (who.get("name") or "").strip().split()
+    default_first = names[0] if names else ""
+    default_last  = names[-1] if len(names) > 1 else ""
     for key, sels in fields:
-        val = who.get(key, "") or who.get(key.replace("_name",""))
+        val = who.get(key,"")
+        if not val:
+            if key == "first_name": val = default_first
+            elif key == "last_name": val = default_last
+            elif key == "email": val = who.get("email","")
+            elif key == "phone": val = who.get("phone","")
         for sel in sels:
             try:
                 el = page.locator(sel)
                 if await el.count():
                     await el.first.fill(str(val)); break
             except: pass
+    # Cover note
     for sel in ['textarea[name*="cover"]','textarea[name="cover_letter"]','textarea']:
         try:
             t = page.locator(sel)
             if await t.count():
                 await t.first.fill(cover_text[:4000]); break
         except: pass
+    # Submit
     for sel in ['button[type="submit"]','input[type="submit"]','button:has-text("Submit")','button:has-text("Apply")']:
         try:
             b = page.locator(sel)
@@ -55,32 +65,44 @@ async def _apply_greenhouse(page, url: str, who: Dict, resume_path: str, cover_t
 
 async def _apply_lever(page, url: str, who: Dict, resume_path: str, cover_text: str) -> str:
     await page.goto(url, wait_until="domcontentloaded", timeout=COMMON_TIMEOUT)
+    # Upload resume
     for sel in ['input[type="file"][name="resume"]','input[type="file"]']:
         try:
             up = page.locator(sel)
             if await up.count():
                 await up.set_input_files(resume_path); break
         except: pass
+    # Basic fields
     fields = [
         ("first_name", ['input[name="name.first"]','input[name="firstName"]','input[placeholder*="First"]']),
         ("last_name",  ['input[name="name.last"]','input[name="lastName"]','input[placeholder*="Last"]']),
         ("email",      ['input[type="email"]','input[name="email"]']),
         ("phone",      ['input[type="tel"]','input[name="phone"]']),
     ]
+    names = (who.get("name") or "").strip().split()
+    default_first = names[0] if names else ""
+    default_last  = names[-1] if len(names) > 1 else ""
     for key, sels in fields:
-        val = who.get(key, "")
+        val = who.get(key,"")
+        if not val:
+            if key == "first_name": val = default_first
+            elif key == "last_name": val = default_last
+            elif key == "email": val = who.get("email","")
+            elif key == "phone": val = who.get("phone","")
         for sel in sels:
             try:
                 el = page.locator(sel)
                 if await el.count():
                     await el.first.fill(str(val)); break
             except: pass
+    # Cover note
     for sel in ['textarea[name="coverLetterText"]','textarea[name*="cover"]','textarea']:
         try:
             t = page.locator(sel)
             if await t.count():
                 await t.first.fill(cover_text[:4000]); break
         except: pass
+    # Submit
     for sel in ['button[type="submit"]','button:has-text("Submit")','button:has-text("Apply")']:
         try:
             b = page.locator(sel)
