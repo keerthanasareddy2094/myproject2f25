@@ -1,25 +1,19 @@
-# app.py — CSUSB Internship Assistant (full app)
+# app.py — CSUSB Internship Assistant (deep-scrape + apply)
 # Features:
-#  - Greeting + general chat (works without LLM via rule-based answers; richer with Ollama)
-#  - List CSUSB internships (scraper)
-#  - Apply flow:
-#      * Phase 1: short questionnaire (up to 10 Qs)
-#      * Phase 2: résumé upload, profile extraction, ranking, Application Kits
-#      * Auto-Apply (beta) for Greenhouse/Lever via Playwright
+#  - Greeting + simple Q&A (works without LLM; uses LLM if available)
+#  - Deep-scrape: CSUSB page -> follow out to career platforms -> collect INTERNSHIP POSTINGS (not just portals)
+#  - Filters by company keywords (e.g., "amazon internships")
+#  - "Apply for internships" → interview → resume upload → profile extraction → ranking → Application Kits → Auto-Apply (Greenhouse/Lever)
 #
-# Place this file at repo root. Keep auto_apply.py (underscore) in the same folder.
+# NOTES:
+#  - Deep-scrape is conservative and capped to avoid heavy crawling. It targets common career platforms.
+#  - Auto-Apply supports Greenhouse & Lever (best-effort form fill). Others marked "manual_required".
 
-import os, re, io, json, urllib.request, requests, pandas as pd, streamlit as st, nest_asyncio, asyncio
-from urllib.parse import urljoin, urlparse
+import os, re, io, json, time, asyncio, urllib.request, requests, pandas as pd, streamlit as st, nest_asyncio
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-
-# ---- Optional Auto-Apply (Greenhouse/Lever). Hide if helper missing.
-AUTO_APPLY_AVAILABLE = True
-try:
-    from auto_apply import auto_apply_batch
-except Exception:
-    AUTO_APPLY_AVAILABLE = False
+from auto_apply import auto_apply_batch
 
 nest_asyncio.apply()
 
@@ -32,7 +26,64 @@ SYS       = os.getenv("SYSTEM_PROMPT", "You are a helpful, concise assistant.")
 MAX_TOK   = int(os.getenv("MAX_TOKENS", "256"))
 NUM_CTX   = int(os.getenv("NUM_CTX", "2048"))
 
+PLATFORMS = {
+    "greenhouse": "greenhouse.io",
+    "lever": "lever.co",
+    "workday": "workday",
+    "smartrecruiters": "smartrecruiters.com",
+    "icims": "icims.com",
+    "taleo": "taleo.net",
+}
+
+TIMEOUT = 18
+MAX_FOLLOW_PER_SOURCE = 1          # follow up to N portal links per outbound source to keep it fast
+MAX_POSTINGS_PER_PORTAL = 30       # collect up to N internship postings per portal root
+MAX_TOTAL_POSTINGS = 150           # global cap
+
 # -------------------- Helpers --------------------
+def _canon(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+","",(s or "").lower())
+
+def _read_url(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+def _soup(html: str) -> BeautifulSoup:
+    return BeautifulSoup(html, "lxml")
+
+def _is_internish(text: str) -> bool:
+    s = (text or "").lower()
+    return ("intern" in s) or ("co-op" in s) or ("co op" in s) or ("internship" in s)
+
+def _job_like_path(path: str) -> bool:
+    """
+    For portals that we fetch without JS, prefer detail pages /jobs/ /job/ /positions/ with an id-like segment.
+    """
+    p = (path or "/").lower()
+    if re.search(r"/job[s]?/|/position[s]?/|/opportunit|/careers/|/opening|/vacanc", p):
+        return True
+    # numeric or req-id style segments
+    if re.search(r"[/-](req|job|r[e]?q|gh_jid|gh_src|posting)[-_]?\d+", p):
+        return True
+    # many Greenhouse/Lever detail pages just use /jobs/<id> or /apply/<id>
+    if re.search(r"/apply/|/jobs?/", p):
+        return True
+    return False
+
+def _host(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def _platform_of(url: str) -> str:
+    h = _host(url)
+    for name, pat in PLATFORMS.items():
+        if pat in h:
+            return name
+    return "other"
+
 def ollama_ready(host: str) -> bool:
     try:
         with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=2) as r:
@@ -40,12 +91,13 @@ def ollama_ready(host: str) -> bool:
     except Exception:
         return False
 
+# Simple Q&A fallback when LLM not available
 _SIMPLE_QA = {
     r"\b(hi|hello|hey)\b": "Hi! I’m the CSUSB Internship Assistant. I can list internships, answer quick questions, and help you apply.",
     r"\b(who are you|your name)\b": "I’m the CSUSB Internship Assistant. I help you find and apply to internships.",
-    r"\b(what can you do|help|capabilities)\b": "I can: (1) list internships from the CSUSB page, (2) guide you to apply, (3) draft emails/ATS keywords, and (4) auto-fill Greenhouse/Lever forms.",
+    r"\b(what can you do|help|capabilities)\b": "I can: (1) list internships from CSUSB’s page, (2) match you to roles after a quick interview, (3) draft materials, (4) auto-apply on Greenhouse/Lever.",
     r"\b(how (do|to) apply|apply steps)\b": "Say “apply for internships”. I’ll ask a few questions, read your résumé (optional), then show matches and generate application materials.",
-    r"\b(internship tips|resume tips|cv tips|cover letter)\b": "Keep bullets concise and quantified, mirror keywords from the posting, and keep cover letters to ~120 words.",
+    r"\b(internship tips|resume tips|cover letter)\b": "Keep bullets quantified, mirror keywords from postings, keep cover letters ~120 words.",
 }
 def rule_based_answer(user: str) -> str:
     s = (user or "").lower().strip()
@@ -56,76 +108,6 @@ def rule_based_answer(user: str) -> str:
         return "Say “internships” to list CSUSB postings, or “apply for internships” to start a short questionnaire."
     return "I can list internships, answer quick questions, and help you apply. Try “internships” or “apply for internships”."
 
-# Interview (Phase-1)
-INTERVIEW_QUESTIONS = [
-    ("role",       "What roles are you targeting? (e.g., software, data, security)"),
-    ("skills",     "List your top 5–8 skills (comma-separated)."),
-    ("company",    "Any preferred companies? (optional)"),
-    ("location",   "Preferred location(s)? (optional)"),
-    ("remote",     "Remote type preference? (any/remote/hybrid/onsite)"),
-    ("exp",        "Rough years of experience (0/0.5/1/2…)? (optional)"),
-    ("courses",    "Relevant courses or projects? (optional, comma-separated)"),
-    ("clearance",  "Do you hold any work authorization or clearance? (optional)"),
-    ("availability","When can you start? (e.g., immediately, Jan 2026)"),
-    ("extras",     "Anything else you want us to prioritize? (optional)"),
-]
-def merge_interview_into_profile(answers: dict) -> dict:
-    roles = [w.strip() for w in (answers.get("role") or "").split(",") if w.strip()]
-    skills = [w.strip() for w in (answers.get("skills") or "").split(",") if w.strip()]
-    try:
-        exp_years = float((answers.get("exp") or "").replace("+","").strip())
-    except Exception:
-        exp_years = None
-    return {"roles": roles, "skills": skills, "exp_years": exp_years}
-
-# -------------------- Scraper (CSUSB page) --------------------
-BAD_LAST = {"careers","career","jobs","job","students","graduates","early-careers"}
-JUNK_KEYWORDS = {
-    "proposal form","evaluation form","student evaluation","supervisor evaluation",
-    "report form","handbook","resume","cv","scholarship","scholarships","grant program",
-    "career center","advising","policy","forms","pdf"
-}
-def _clean(s:str)->str:
-    return re.sub(r"\s+"," ", (s or "")).strip()
-def _path_is_specific(path:str)->bool:
-    p = (path or "/").lower()
-    if "intern" in p or "co-op" in p: return True
-    seg = [s for s in p.split("/") if s]
-    if any(re.search(r"\d{5,}", s) for s in seg): return True
-    if seg and seg[-1] in BAD_LAST: return False
-    return len(seg) >= 3
-def _is_intern_link(text, url)->bool:
-    low = f"{text} {url}".lower()
-    if any(k in low for k in JUNK_KEYWORDS): return False
-    if not ("intern" in low or "co-op" in low): return False
-    try: return _path_is_specific(urlparse(url).path)
-    except Exception: return False
-def _canon(s: str) -> str:
-    return re.sub(r"[^a-z0-9]","",(s or "").lower())
-
-@st.cache_data(ttl=60*30, show_spinner=False)
-def scrape_csusb() -> pd.DataFrame:
-    r = requests.get(CSUSB_URL, headers={"User-Agent": UA}, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    main = soup.find("main") or soup
-    rows, seen = [], set()
-    for a in main.find_all("a", href=True):
-        t = _clean(a.get_text(" ", strip=True))
-        if not t: continue
-        absu = urljoin(CSUSB_URL, a["href"])
-        k = (t.lower(), absu)
-        if k in seen: continue
-        if not _is_intern_link(t, absu): continue
-        host = urlparse(absu).netloc.lower()
-        comp = host.split(".")[-2].capitalize() if host else ""
-        rows.append({"title": t, "company": comp, "link": absu, "host": host,
-                     "posted": datetime.utcnow().date().isoformat(),
-                     "blob": _canon(f"{t} {comp} {host} {absu}")})
-        seen.add(k)
-    return pd.DataFrame(rows)
-
-# -------------------- LLM (optional via Ollama) --------------------
 def llm_answer(prompt: str, sys_msg: str = None) -> str:
     try:
         from langchain_ollama import ChatOllama
@@ -137,7 +119,29 @@ def llm_answer(prompt: str, sys_msg: str = None) -> str:
     except Exception:
         return ""
 
-# -------------------- Résumé parsing --------------------
+# -------------------- Phase 1 Interview --------------------
+INTERVIEW_QUESTIONS = [
+    ("role",       "What roles are you targeting? (e.g., software, data, security)"),
+    ("skills",     "List your top 5–8 skills (comma-separated)."),
+    ("company",    "Any preferred companies? (optional)"),
+    ("location",   "Preferred location(s)? (optional)"),
+    ("remote",     "Remote type preference? (any/remote/hybrid/onsite)"),
+    ("exp",        "Rough years of experience (0/0.5/1/2…)? (optional)"),
+    ("courses",    "Relevant courses or projects? (optional, comma-separated)"),
+    ("availability","When can you start? (e.g., immediately, Jan 2026)"),
+    ("auth",       "Work authorization (e.g., US citizen, OPT, CPT, H1B)? (optional)"),
+    ("extras",     "Anything else to prioritize? (optional)"),
+]
+def merge_interview_into_profile(answers: dict) -> dict:
+    roles = [w.strip() for w in (answers.get("role") or "").split(",") if w.strip()]
+    skills = [w.strip() for w in (answers.get("skills") or "").split(",") if w.strip()]
+    try:
+        exp_years = float((answers.get("exp") or "").replace("+","").strip())
+    except Exception:
+        exp_years = None
+    return {"roles": roles, "skills": skills, "exp_years": exp_years}
+
+# -------------------- Resume parse --------------------
 def extract_text_from_upload(upload):
     if not upload: return ""
     name = (upload.name or "").lower()
@@ -169,7 +173,7 @@ SKILL_LEXICON = {
 }
 ROLE_LEXICON = {"software","data","ml","ai","security","cloud","devops","qa","sre","web","backend","frontend","mobile"}
 
-def extract_profile(resume_text: str, role_hint: str, skills_hint: str):
+def resume_to_profile(resume_text: str, role_hint: str, skills_hint: str):
     toks = re.findall(r"[A-Za-z][A-Za-z0-9\+\.\-#]{1,}", (resume_text or "").lower())
     skills = sorted({t for t in toks if t in SKILL_LEXICON})
     roles  = sorted({t for t in toks if t in ROLE_LEXICON})
@@ -188,28 +192,161 @@ def extract_profile(resume_text: str, role_hint: str, skills_hint: str):
         except: pass
     return {"roles": roles, "skills": skills, "exp_years": exp_years}
 
+# -------------------- Scraping: CSUSB + Deep to portals --------------------
+def scrape_csusb_links() -> list[dict]:
+    """Pull outbound links from CSUSB page (fast)."""
+    html = _read_url(CSUSB_URL)
+    soup = _soup(html)
+    main = soup.find("main") or soup
+    rows, seen = [], set()
+    for a in main.find_all("a", href=True):
+        t = re.sub(r"\s+"," ", a.get_text(" ", strip=True))
+        if not t: continue
+        absu = urljoin(CSUSB_URL, a["href"])
+        k = (t.lower(), absu)
+        if k in seen: continue
+        if not _is_internish(t + " " + absu):  # keep only obviously internship-ish
+            continue
+        host = _host(absu)
+        comp = host.split(".")[-2].capitalize() if host else ""
+        rows.append({"title": t, "company_guess": comp, "link": absu, "host": host})
+        seen.add(k)
+    return rows
+
+def collect_postings_from_portal(root_url: str, limit=MAX_POSTINGS_PER_PORTAL) -> list[dict]:
+    """
+    Heuristic deep-scrape for common portals using requests+bs4 (no JS).
+    We only keep detail pages that look like job postings AND contain 'intern' text.
+    """
+    out, seen = [], set()
+    try:
+        html = _read_url(root_url)
+    except Exception:
+        return out
+    soup = _soup(html)
+    base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(root_url))
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        absu = urljoin(base, href)
+        p = urlparse(absu).path
+        text = a.get_text(" ", strip=True)
+        if not _is_internish(text + " " + absu):
+            continue
+        if not _job_like_path(p):
+            continue
+        key = absu.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": text or "Internship", "link": absu})
+        if len(out) >= limit:
+            break
+    # If we found nothing, also consider the full page text and look for A tags with internish in URL alone
+    if not out:
+        for a in soup.find_all("a", href=True):
+            absu = urljoin(base, a["href"])
+            if "intern" in absu.lower() and _job_like_path(urlparse(absu).path):
+                key = absu.lower()
+                if key in seen: continue
+                seen.add(key)
+                out.append({"title": a.get_text(" ", strip=True) or "Internship", "link": absu})
+                if len(out) >= limit: break
+    return out
+
+@st.cache_data(ttl=60*20, show_spinner=False)
+def deep_collect_postings() -> pd.DataFrame:
+    """
+    1) Get internship-ish outbound links from CSUSB page.
+    2) For each link:
+       - If it's a well-known job portal root/listing, collect individual internship postings.
+       - Else if it already looks like a posting, keep it.
+    """
+    sources = scrape_csusb_links()
+    all_rows, total = [], 0
+    for src in sources:
+        url = src["link"]
+        plat = _platform_of(url)
+        # If already looks like a posting (detail page), keep it directly
+        if _job_like_path(urlparse(url).path) and _is_internish(url):
+            all_rows.append({
+                "title": src["title"],
+                "company": src["company_guess"],
+                "link": url,
+                "platform": plat,
+                "source": CSUSB_URL,
+                "posted": datetime.utcnow().date().isoformat(),
+                "blob": _canon(f"{src['title']} {src['company_guess']} {url} {plat}")
+            })
+            total += 1
+            if total >= MAX_TOTAL_POSTINGS: break
+            continue
+
+        # If it's a known portal, follow it and pull detail postings
+        if plat in PLATFORMS:
+            # follow only a few unique portal roots to avoid hammering
+            postings = collect_postings_from_portal(url, limit=MAX_POSTINGS_PER_PORTAL)
+            for p in postings:
+                all_rows.append({
+                    "title": p["title"],
+                    "company": src["company_guess"] or urlparse(p["link"]).netloc.split(".")[-2].capitalize(),
+                    "link": p["link"],
+                    "platform": plat,
+                    "source": url,
+                    "posted": datetime.utcnow().date().isoformat(),
+                    "blob": _canon(f"{p['title']} {src['company_guess']} {p['link']} {plat}")
+                })
+                total += 1
+                if total >= MAX_TOTAL_POSTINGS: break
+        # else: ignore generic pages (not detail)
+
+        if total >= MAX_TOTAL_POSTINGS:
+            break
+
+    # Deduplicate by link
+    if not all_rows:
+        return pd.DataFrame(columns=["title","company","link","platform","source","posted","blob"])
+    df = pd.DataFrame(all_rows).drop_duplicates(subset=["link"]).reset_index(drop=True)
+    return df
+
 # -------------------- Matching & scoring --------------------
 def score_posting(row, profile, company_pref, location, remote):
     score = 0
     blob = row.get("blob","")
-    for r in profile["roles"]:
+    for r in (profile or {}).get("roles", []):
         if _canon(r) in blob: score += 3
-    for s in profile["skills"]:
+    for s in (profile or {}).get("skills", []):
         if _canon(s) in blob: score += 2
     if company_pref and _canon(company_pref) in blob: score += 4
     if location and _canon(location) in blob: score += 1
     if remote and remote.lower()!="any" and _canon(remote) in blob: score += 1
     return score
 
-def filter_and_rank(df, profile, company, location, remote):
+def filter_rank(df, profile, query_text: str):
     if df.empty: return df
-    df = df.copy()
-    df["match_score"] = df.apply(lambda r: score_posting(r, profile, company, location, remote), axis=1)
-    df = df.sort_values(["match_score","posted"], ascending=[False, False])
-    good = df[df["match_score"] >= 3]
-    return good.head(15) if not good.empty else df.head(15)
+    q = (query_text or "").strip().lower()
+    comp_tok = None
+    if "intern" in q:
+        # crude company token extraction: last non-generic word before 'intern'
+        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9\-\.]{1,}", q)
+        for i, t in enumerate(tokens):
+            if "intern" in t.lower() and i > 0:
+                comp_tok = tokens[i-1]
+                break
 
-# -------------------- Application Kit generation --------------------
+    # textual filter by query
+    if comp_tok:
+        tok = _canon(comp_tok)
+        df = df[df["blob"].str.contains(tok, na=False)]
+        if df.empty:
+            return df
+
+    # score and rank
+    df = df.copy()
+    df["match_score"] = df.apply(lambda r: score_posting(r, profile, comp_tok, None, "any"), axis=1)
+    df = df.sort_values(["match_score","posted"], ascending=[False, False])
+    return df
+
+# -------------------- Application Kit --------------------
 def build_application_kit(posting, profile, who):
     prompt = f"""
 You are an internship application assistant. Create succinct, professional materials.
@@ -246,33 +383,34 @@ Link: {posting.get('link','')}
 """
     return out, txt
 
-# -------------------- Streamlit UI --------------------
+# -------------------- UI --------------------
 st.set_page_config(page_title="CSUSB Internship Assistant", page_icon="💬", layout="wide")
 st.title("💬 CSUSB Internship Assistant")
-st.caption("Greet → general chat • say “internships” to list • say “apply for internships” to personalize, upload résumé, generate Application Kits, and Auto-Apply (Greenhouse/Lever).")
+st.caption("Greet → general chat • say “internships” to list (deep scrape to posting pages) • say “apply for internships” to personalize, upload résumé, generate Application Kits, and Auto-Apply (Greenhouse/Lever).")
 
-# Session state
+# Session state init
 for k, v in {
     "mode": "greet",
-    "applicant_info": None,
-    "profile": None,
-    "ranked_rows": None,
     "llm_ready": ollama_ready(OLLAMA),
     "interview_active": False,
     "interview_idx": 0,
     "interview_answers": {},
+    "applicant_info": None,
+    "profile": None,
+    "results_df": None,
+    "selected": set(),
 }.items():
     if k not in st.session_state: st.session_state[k] = v
 
-# 1) Greeting / Router
+# Greet
 if st.session_state["mode"] == "greet":
     st.markdown("**Hi! How can I help you today?**")
-    user = st.text_input("Type here (e.g., 'Show internships', 'Apply for internships', or any question) 👇")
+    user = st.text_input("Type here (e.g., 'Amazon internships', 'Apply for internships', or any question) 👇")
     if not user:
         st.stop()
     txt = user.lower()
 
-    # Route: Apply (interview first)
+    # Route: apply
     if re.search(r"\b(apply|application|apply for)\b.*\b(intern|internship)", txt) or txt.strip() in {"apply", "apply for internships"}:
         st.session_state["interview_active"] = True
         st.session_state["interview_idx"] = 0
@@ -280,33 +418,47 @@ if st.session_state["mode"] == "greet":
         st.session_state["mode"] = "apply"
         st.rerun()
 
-    # Route: list internships
-    if re.search(r"\b(intern|internship|show internships|list internships)\b", txt):
-        st.session_state["mode"] = "list"; st.rerun()
+    # Route: list/search
+    if "intern" in txt:
+        with st.spinner("Deep-scraping internship postings…"):
+            df = deep_collect_postings()
+        if df.empty:
+            st.warning("No internship postings found right now.")
+        else:
+            # filter & rank w/ minimal profile (none yet)
+            df2 = filter_rank(df, None, user)
+            st.session_state["results_df"] = df2
+            st.session_state["mode"] = "list"
+            st.rerun()
 
-    # General chat
-    if st.session_state["llm_ready"]:
-        ans = llm_answer(user) or rule_based_answer(user)
-    else:
+    # General Q&A
+    ans = llm_answer(user) if st.session_state["llm_ready"] else ""
+    if not ans:
         ans = rule_based_answer(user)
     st.markdown("**Assistant:** " + ans)
     st.stop()
 
-# 2) List internships (CSUSB)
+# List results (from greet search or manual)
 if st.session_state["mode"] == "list":
-    st.subheader("🔎 Internships from CSUSB – Internships & Careers")
-    with st.spinner("Fetching internships…"):
-        df = scrape_csusb()
-    if df.empty:
-        st.warning("No internship postings found on the CSUSB page right now.")
+    st.subheader("🔎 Internship Postings (deep-scraped)")
+    df = st.session_state.get("results_df")
+    if df is None:
+        with st.spinner("Deep-scraping internship postings…"):
+            df = deep_collect_postings()
+        st.session_state["results_df"] = df
+    if df is None or df.empty:
+        st.warning("No internship postings found at the moment.")
     else:
-        st.dataframe(df[["title","company","link"]], use_container_width=True, hide_index=True)
-    if st.button("Back ↩️"):
-        st.session_state["mode"]="greet"; st.rerun()
+        view = df[["title","company","platform","link","posted"]].reset_index(drop=True)
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.caption("Tip: Use the “Apply for internships” flow to personalize, upload résumé, rank, generate kits, and auto-apply.")
 
-# 3) Apply flow (Phase-1 interview → Phase-2 form/results/kits/auto-apply)
+    if st.button("Back ↩️"):
+        st.session_state["mode"] = "greet"; st.rerun()
+
+# Apply flow (interview -> form -> rank -> kits -> auto-apply)
 if st.session_state["mode"] == "apply":
-    # --- Interview phase (if active) ---
+    # 1) Interview
     if st.session_state.get("interview_active", False):
         idx = st.session_state.get("interview_idx", 0)
         if idx < len(INTERVIEW_QUESTIONS):
@@ -325,15 +477,14 @@ if st.session_state["mode"] == "apply":
                 st.rerun()
             st.stop()
         else:
-            # interview done → prefill profile for form
+            # finish interview
             A = st.session_state.get("interview_answers", {})
-            prof_from_q = merge_interview_into_profile(A)
-            st.session_state["profile"] = prof_from_q
+            st.session_state["profile"] = merge_interview_into_profile(A)
             st.session_state["interview_active"] = False
             st.success("Thanks! I used your answers to prefill your preferences below.")
 
-    st.subheader("🧭 Personalized Internship Finder & Application")
-
+    # 2) Application form
+    st.subheader("📄 Your Info & Preferences")
     with st.form("apply_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -342,117 +493,110 @@ if st.session_state["mode"] == "apply":
             phone = st.text_input("Phone")
         with c2:
             linkedin = st.text_input("LinkedIn URL")
-            location = st.text_input("Preferred location (optional)",
-                                     value=(st.session_state.get("interview_answers", {}).get("location") or ""))
+            location = st.text_input("Preferred location (optional)")
             remote   = st.selectbox("Remote type", ["Any","Remote","Hybrid","Onsite"], index=0)
 
-        role_hint   = st.text_input("Desired role(s) (e.g., software, data, security)",
-                                    value=", ".join((st.session_state.get("profile") or {}).get("roles", [])))
-        company     = st.text_input("Preferred company (optional)",
-                                    value=(st.session_state.get("interview_answers", {}).get("company") or ""))
-        skills_hint = st.text_input("Top skills (comma-separated)",
-                                    value=", ".join((st.session_state.get("profile") or {}).get("skills", [])))
-        resume      = st.file_uploader("Upload résumé (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
+        pref_company = st.text_input("Preferred company (optional)")
+        role_hint    = st.text_input("Desired role(s) (e.g., software, data, security)",
+                                     value=", ".join(st.session_state.get("profile",{}).get("roles",[])))
+        skills_hint  = st.text_input("Top skills (comma-separated)",
+                                     value=", ".join(st.session_state.get("profile",{}).get("skills",[])))
+        resume       = st.file_uploader("Upload résumé (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
 
-        submitted = st.form_submit_button("Find Internships 🔍")
+        submitted = st.form_submit_button("Find & Rank Internships 🔍")
 
+    # 3) Ranking
+    ranked = None
     if submitted:
         resume_text = extract_text_from_upload(resume)
-        base_prof = st.session_state.get("profile") or {"roles":[], "skills":[], "exp_years":None}
-        # merge resume extraction + hints
-        extracted = extract_profile(resume_text, role_hint, skills_hint)
-        merged = {
-            "roles": sorted(set((base_prof.get("roles") or []) + (extracted.get("roles") or []))),
-            "skills": sorted(set((base_prof.get("skills") or []) + (extracted.get("skills") or []))),
-            "exp_years": extracted.get("exp_years") or base_prof.get("exp_years"),
-        }
-        with st.spinner("Searching CSUSB postings…"):
-            df = scrape_csusb()
-        ranked = filter_and_rank(df, merged, company, location, remote) if not df.empty else pd.DataFrame()
+        prof = resume_to_profile(resume_text, role_hint, skills_hint)
+        st.session_state["profile"] = prof
+        with st.spinner("Deep-scraping internship postings…"):
+            df = deep_collect_postings()
+        if df.empty:
+            st.warning("No internship postings found.")
+        else:
+            df2 = df.copy()
+            # simple textual company filter first if provided
+            if pref_company:
+                df2 = df2[df2["blob"].str.contains(_canon(pref_company), na=False)]
+                if df2.empty:
+                    df2 = df.copy()  # fallback
+            # rank
+            df2["match_score"] = df2.apply(lambda r: score_posting(r, prof, pref_company, location, remote), axis=1)
+            df2 = df2.sort_values(["match_score","posted"], ascending=[False, False]).reset_index(drop=True)
+            ranked = df2.head(30)
+            st.session_state["results_df"] = ranked
 
-        st.session_state["applicant_info"] = {"name":name,"email":email,"phone":phone,"linkedin":linkedin}
-        st.session_state["profile"] = merged
-        st.session_state["ranked_rows"] = [] if ranked.empty else ranked.to_dict("records")
-        st.success("Results ready below. Select postings and click **Generate Application Kit**.")
-
-    ranked_rows = st.session_state["ranked_rows"]
-    if ranked_rows:
+    df = st.session_state.get("results_df")
+    if df is not None and not df.empty:
         st.subheader("🎯 Best Matches")
-        st.caption("Select the internships you want to apply to, then click **Generate Application Kit**.")
-        for i, r in enumerate(ranked_rows, start=1):
-            with st.expander(f"{i}. {r['title']} — {r.get('company','')}"):
+        st.caption("Select internships you want to apply to, then generate Application Kits or Auto-Apply (Greenhouse/Lever).")
+        picks = []
+        for i, r in df.iterrows():
+            key = f"pick_{i}"
+            with st.expander(f"{i+1}. {r['title']} — {r.get('company','')} ({r.get('platform','')})"):
                 st.write(f"[Open posting / Apply]({r['link']})")
-                st.checkbox("Select this internship", key=f"pick_{i}", value=False)
+                chosen = st.checkbox("Select this internship", key=key, value=False)
+                if chosen:
+                    picks.append(r.to_dict())
 
-        # Generate kits
-        if st.button("Generate Application Kit"):
-            who = st.session_state.get("applicant_info") or {}
+        # 4) Application Kits
+        if st.button("Generate Application Kits"):
+            who = {
+                "name": name, "email": email, "phone": phone, "linkedin": linkedin
+            }
             prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
-            picked = [r for i, r in enumerate(ranked_rows, start=1) if st.session_state.get(f"pick_{i}", False)]
-            if not picked:
+            if not picks:
                 st.warning("Select at least one internship above.")
             else:
-                for r in picked:
-                    kit_md, kit_txt = build_application_kit(
-                        {"title":r.get("title"), "company":r.get("company"), "link":r.get("link")}, prof, who
-                    )
-                    st.markdown(f"**Application Kit – {r.get('title')} @ {r.get('company','')}**")
+                for item in picks:
+                    kit_md, kit_txt = build_application_kit(item, prof, who)
+                    st.markdown(f"**Application Kit – {item.get('title')} @ {item.get('company','')}**")
                     st.markdown(kit_md or "_(Enable Ollama for richer kits.)_")
                     st.download_button(
-                        label=f"⬇️ Download Kit ({r.get('company','')[:20]} – {r.get('title','')[:30]})",
+                        label=f"⬇️ Download Kit ({item.get('company','')[:18]} – {item.get('title','')[:26]})",
                         data=kit_txt.encode("utf-8"),
-                        file_name=f"application_kit_{_canon(r.get('company',''))}_{_canon(r.get('title',''))}.txt",
+                        file_name=f"application_kit_{_canon(item.get('company',''))}_{_canon(item.get('title',''))}.txt",
                         mime="text/plain"
                     )
 
-        # Auto-Apply (Greenhouse / Lever)
+        # 5) Auto-Apply
         st.markdown("---")
-        if AUTO_APPLY_AVAILABLE:
-            st.subheader("⚡ Auto-Apply (beta) — Greenhouse & Lever only")
-            st.caption("Fills common fields (name, email, phone, résumé, cover letter). Other portals will require manual apply.")
-            resume_for_auto = st.file_uploader("Upload résumé for auto-apply (PDF preferred)", type=["pdf"], key="resume_for_auto")
-
-            if st.button("Auto-apply to selected"):
-                picked = [r for i, r in enumerate(ranked_rows, start=1) if st.session_state.get(f"pick_{i}", False)]
-                if not picked:
-                    st.warning("Select at least one internship above.")
-                    st.stop()
-                if not resume_for_auto:
-                    st.warning("Please upload your resume (PDF) for auto-apply.")
-                    st.stop()
-
-                who = st.session_state.get("applicant_info") or {}
-                prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
-                cover = llm_answer(
-                    f"Write a concise 6–8 line cover letter for internships. Roles={prof.get('roles')}, "
-                    f"skills={prof.get('skills')}. Mention eagerness to learn and link to LinkedIn: {who.get('linkedin','')}.",
-                    sys_msg="Professional, succinct tone."
-                ) or (
-                    f"Dear Hiring Team,\n\n"
-                    f"I am excited to apply for internship roles. My background includes {', '.join(prof.get('skills')[:6])} "
-                    f"and interests in {', '.join(prof.get('roles')[:3])}. I am eager to contribute and learn.\n"
-                    f"LinkedIn: {who.get('linkedin','')}\n\n"
-                    f"Thank you for your consideration.\n"
-                    f"{who.get('name','')}\n{who.get('email','')}\n{who.get('phone','')}"
-                )
-
-                with st.spinner("Submitting applications…"):
-                    resume_bytes = resume_for_auto.read()
-                    try:
-                        results = asyncio.run(auto_apply_batch(picked, who, resume_bytes, cover))
-                    except Exception as e:
-                        results = [{"platform":"n/a","status":f"error: {e}","final_url":"n/a","title":"n/a","company":"n/a","url":"n/a"}]
-
-                st.success("Auto-apply finished. Review statuses below.")
-                st.dataframe(pd.DataFrame(results), use_container_width=True)
-                st.markdown(
-                    "Legend: **submitted_or_attempted** = form filled & submit click attempted • "
-                    "**manual_required** = unsupported portal; open link and apply manually."
-                )
-        else:
-            st.info("Auto-Apply helper (auto_apply.py) not found—showing manual apply only. Add the file to enable this feature.")
+        st.subheader("⚡ Auto-Apply (beta) — Greenhouse & Lever only")
+        st.caption("Fills common fields (name, email, phone, résumé, cover note). Other portals will be marked 'manual_required'.")
+        resume_for_auto = st.file_uploader("Upload résumé for auto-apply (PDF preferred)", type=["pdf"], key="resume_for_auto")
+        if st.button("Auto-apply to selected"):
+            if not picks:
+                st.warning("Select at least one internship above.")
+                st.stop()
+            if not resume_for_auto:
+                st.warning("Please upload your resume (PDF) for auto-apply.")
+                st.stop()
+            who = {"name": name, "email": email, "phone": phone, "linkedin": linkedin}
+            prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
+            cover = llm_answer(
+                f"Write a concise 6–8 line cover letter for internships. Roles={prof.get('roles')}, "
+                f"skills={prof.get('skills')}. Mention eagerness to learn and link to LinkedIn: {linkedin}.",
+                sys_msg="Professional, succinct tone."
+            ) or (
+                f"Dear Hiring Team,\n\n"
+                f"I am excited to apply for internship roles. My background includes {', '.join(prof.get('skills')[:6])} "
+                f"and interests in {', '.join(prof.get('roles')[:3])}. I am eager to contribute and learn.\n"
+                f"LinkedIn: {linkedin}\n\n"
+                f"Thank you for your consideration.\n"
+                f"{name}\n{email}\n{phone}"
+            )
+            with st.spinner("Submitting applications…"):
+                results = asyncio.run(auto_apply_batch(picks, who, resume_for_auto.read(), cover))
+            st.success("Auto-apply finished. Review statuses below.")
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+            st.markdown(
+                "Legend: **submitted_or_attempted** = form filled & submit click attempted • "
+                "**manual_required** = unsupported portal; open link and apply manually."
+            )
 
     if st.button("Back ↩️"):
-        for k in ("applicant_info","profile","ranked_rows","interview_active","interview_idx","interview_answers"):
-            st.session_state[k]=None if k not in {"interview_active","interview_idx","interview_answers"} else (False if k=="interview_active" else (0 if k=="interview_idx" else {}))
-        st.session_state["mode"]="greet"; st.rerun()
+        st.session_state["mode"] = "greet"
+        st.session_state["results_df"] = None
+        st.rerun()
