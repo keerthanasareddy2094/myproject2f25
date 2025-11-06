@@ -13,10 +13,9 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Playwright browser + OS deps
+# Playwright browser + deps
 RUN python -m playwright install --with-deps chromium
 
-# Copy entire project
 COPY . /app/
 
 EXPOSE 8501
