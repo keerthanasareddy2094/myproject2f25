@@ -1,168 +1,26 @@
-# app.py — CSUSB Internship Assistant (deep-scrape + apply)
-# Features:
-#  - Greeting + simple Q&A (works without LLM; uses LLM if available)
-#  - Deep-scrape: CSUSB page -> follow out to career platforms -> collect INTERNSHIP POSTINGS (not just portals)
-#  - Filters by company keywords (e.g., "amazon internships")
-#  - "Apply for internships" → interview → resume upload → profile extraction → ranking → Application Kits → Auto-Apply (Greenhouse/Lever)
-#
-# NOTES:
-#  - Deep-scrape is conservative and capped to avoid heavy crawling. It targets common career platforms.
-#  - Auto-Apply supports Greenhouse & Lever (best-effort form fill). Others marked "manual_required".
+# app.py — Fast résumé parsing + LLM-only cover letter (Ollama) + CSUSB listings
+# Requirements you should have installed somewhere in your setup:
+#   pip install streamlit requests bs4 lxml pandas pymupdf python-docx
+# And make sure an Ollama server is running with a model pulled, e.g.:
+#   ollama serve  (separate)  and  ollama pull llama3.2:3b
 
-import os, re, io, json, time, asyncio, urllib.request, requests, pandas as pd, streamlit as st, nest_asyncio
-from datetime import datetime
-from urllib.parse import urljoin, urlparse
+import os, re, io, hashlib, json
+import requests
+import pandas as pd
+import streamlit as st
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from auto_apply import auto_apply_batch
 
-nest_asyncio.apply()
-
-# -------------------- Config --------------------
+# --------------------------- Config ---------------------------
 CSUSB_URL = "https://www.csusb.edu/cse/internships-careers"
 UA        = "Mozilla/5.0 (CSUSB Internship Assistant)"
-OLLAMA    = os.getenv("OLLAMA_HOST", "http://ollama:11434").rstrip("/")
-MODEL     = os.getenv("MODEL_NAME", "qwen2:0.5b")
-SYS       = os.getenv("SYSTEM_PROMPT", "You are a helpful, concise assistant.")
-MAX_TOK   = int(os.getenv("MAX_TOKENS", "256"))
-NUM_CTX   = int(os.getenv("NUM_CTX", "2048"))
+MODEL     = os.getenv("MODEL_NAME", "llama3.2:3b")   # try qwen2:0.5b or llama3.2:3b
+OLLAMA    = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+NUM_CTX   = int(os.getenv("NUM_CTX", "1024"))        # small ctx for speed
+NUM_PRED  = int(os.getenv("NUM_PREDICT", "220"))
+TEMP      = float(os.getenv("TEMPERATURE", "0.2"))
 
-PLATFORMS = {
-    "greenhouse": "greenhouse.io",
-    "lever": "lever.co",
-    "workday": "workday",
-    "smartrecruiters": "smartrecruiters.com",
-    "icims": "icims.com",
-    "taleo": "taleo.net",
-}
-
-TIMEOUT = 18
-MAX_FOLLOW_PER_SOURCE = 1          # follow up to N portal links per outbound source to keep it fast
-MAX_POSTINGS_PER_PORTAL = 30       # collect up to N internship postings per portal root
-MAX_TOTAL_POSTINGS = 150           # global cap
-
-# -------------------- Helpers --------------------
-def _canon(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+","",(s or "").lower())
-
-def _read_url(url: str) -> str:
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
-
-def _soup(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "lxml")
-
-def _is_internish(text: str) -> bool:
-    s = (text or "").lower()
-    return ("intern" in s) or ("co-op" in s) or ("co op" in s) or ("internship" in s)
-
-def _job_like_path(path: str) -> bool:
-    """
-    For portals that we fetch without JS, prefer detail pages /jobs/ /job/ /positions/ with an id-like segment.
-    """
-    p = (path or "/").lower()
-    if re.search(r"/job[s]?/|/position[s]?/|/opportunit|/careers/|/opening|/vacanc", p):
-        return True
-    # numeric or req-id style segments
-    if re.search(r"[/-](req|job|r[e]?q|gh_jid|gh_src|posting)[-_]?\d+", p):
-        return True
-    # many Greenhouse/Lever detail pages just use /jobs/<id> or /apply/<id>
-    if re.search(r"/apply/|/jobs?/", p):
-        return True
-    return False
-
-def _host(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-def _platform_of(url: str) -> str:
-    h = _host(url)
-    for name, pat in PLATFORMS.items():
-        if pat in h:
-            return name
-    return "other"
-
-def ollama_ready(host: str) -> bool:
-    try:
-        with urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=2) as r:
-            return r.status == 200
-    except Exception:
-        return False
-
-# Simple Q&A fallback when LLM not available
-_SIMPLE_QA = {
-    r"\b(hi|hello|hey)\b": "Hi! I’m the CSUSB Internship Assistant. I can list internships, answer quick questions, and help you apply.",
-    r"\b(who are you|your name)\b": "I’m the CSUSB Internship Assistant. I help you find and apply to internships.",
-    r"\b(what can you do|help|capabilities)\b": "I can: (1) list internships from CSUSB’s page, (2) match you to roles after a quick interview, (3) draft materials, (4) auto-apply on Greenhouse/Lever.",
-    r"\b(how (do|to) apply|apply steps)\b": "Say “apply for internships”. I’ll ask a few questions, read your résumé (optional), then show matches and generate application materials.",
-    r"\b(internship tips|resume tips|cover letter)\b": "Keep bullets quantified, mirror keywords from postings, keep cover letters ~120 words.",
-}
-def rule_based_answer(user: str) -> str:
-    s = (user or "").lower().strip()
-    for pat, ans in _SIMPLE_QA.items():
-        if re.search(pat, s):
-            return ans
-    if "intern" in s:
-        return "Say “internships” to list CSUSB postings, or “apply for internships” to start a short questionnaire."
-    return "I can list internships, answer quick questions, and help you apply. Try “internships” or “apply for internships”."
-
-def llm_answer(prompt: str, sys_msg: str = None) -> str:
-    try:
-        from langchain_ollama import ChatOllama
-        from langchain.prompts import ChatPromptTemplate
-        llm = ChatOllama(base_url=OLLAMA, model=MODEL, temperature=0.2,
-                         model_kwargs={"num_ctx": NUM_CTX, "num_predict": MAX_TOK})
-        tmpl = ChatPromptTemplate.from_messages([("system", sys_msg or SYS), ("human", "{q}")])
-        return (tmpl | llm).invoke({"q": prompt}).content.strip()
-    except Exception:
-        return ""
-
-# -------------------- Phase 1 Interview --------------------
-INTERVIEW_QUESTIONS = [
-    ("role",       "What roles are you targeting? (e.g., software, data, security)"),
-    ("skills",     "List your top 5–8 skills (comma-separated)."),
-    ("company",    "Any preferred companies? (optional)"),
-    ("location",   "Preferred location(s)? (optional)"),
-    ("remote",     "Remote type preference? (any/remote/hybrid/onsite)"),
-    ("exp",        "Rough years of experience (0/0.5/1/2…)? (optional)"),
-    ("courses",    "Relevant courses or projects? (optional, comma-separated)"),
-    ("availability","When can you start? (e.g., immediately, Jan 2026)"),
-    ("auth",       "Work authorization (e.g., US citizen, OPT, CPT, H1B)? (optional)"),
-    ("extras",     "Anything else to prioritize? (optional)"),
-]
-def merge_interview_into_profile(answers: dict) -> dict:
-    roles = [w.strip() for w in (answers.get("role") or "").split(",") if w.strip()]
-    skills = [w.strip() for w in (answers.get("skills") or "").split(",") if w.strip()]
-    try:
-        exp_years = float((answers.get("exp") or "").replace("+","").strip())
-    except Exception:
-        exp_years = None
-    return {"roles": roles, "skills": skills, "exp_years": exp_years}
-
-# -------------------- Resume parse --------------------
-def extract_text_from_upload(upload):
-    if not upload: return ""
-    name = (upload.name or "").lower()
-    try:
-        if name.endswith(".pdf"):
-            import pdfplumber
-            txt = ""
-            with pdfplumber.open(upload) as pdf:
-                for p in pdf.pages:
-                    txt += (p.extract_text() or "") + "\n"
-            return txt
-        elif name.endswith(".docx"):
-            from docx import Document
-            bio = io.BytesIO(upload.read())
-            doc = Document(bio)
-            return "\n".join(p.text for p in doc.paragraphs)
-        else:
-            return upload.read().decode("utf-8", "ignore")
-    except Exception:
-        return ""
-
+# --------------------------- Lexicons (for quick skill/role scan) ---------------------------
 SKILL_LEXICON = {
     "python","java","c++","c#","javascript","typescript","go","rust","kotlin","swift","r","sql",
     "react","angular","vue","node","express","django","flask","fastapi","spring","spring boot",".net",
@@ -173,430 +31,404 @@ SKILL_LEXICON = {
 }
 ROLE_LEXICON = {"software","data","ml","ai","security","cloud","devops","qa","sre","web","backend","frontend","mobile"}
 
-def resume_to_profile(resume_text: str, role_hint: str, skills_hint: str):
-    toks = re.findall(r"[A-Za-z][A-Za-z0-9\+\.\-#]{1,}", (resume_text or "").lower())
-    skills = sorted({t for t in toks if t in SKILL_LEXICON})
-    roles  = sorted({t for t in toks if t in ROLE_LEXICON})
-    if role_hint:
-        for t in re.split(r"[,/; ]+", role_hint.lower()):
-            t=t.strip()
-            if t and t not in roles: roles.append(t)
-    if skills_hint:
-        for t in re.split(r"[,/; ]+", skills_hint.lower()):
-            t=t.strip()
-            if t and t not in skills: skills.append(t)
-    exp_years = None
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:\+)?\s*(?:years|yrs)", (resume_text or "").lower())
-    if m:
-        try: exp_years = float(m.group(1))
-        except: pass
-    return {"roles": roles, "skills": skills, "exp_years": exp_years}
+# --------------------------- Fast résumé extract & parse (cached) ---------------------------
+# Uses PyMuPDF (pymupdf) for fast PDF text; for DOCX uses python-docx.
+import fitz  # PyMuPDF
 
-# -------------------- Scraping: CSUSB + Deep to portals --------------------
-def scrape_csusb_links() -> list[dict]:
-    """Pull outbound links from CSUSB page (fast)."""
-    html = _read_url(CSUSB_URL)
-    soup = _soup(html)
+@st.cache_data(show_spinner=False)
+def extract_resume_fast(file_bytes: bytes, filename: str) -> dict:
+    """Parse résumé once (cached by SHA256): name/email/phone/skills/roles + text snippet."""
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    name = (filename or "").lower()
+    text = ""
+
+    try:
+        if name.endswith(".pdf"):
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                pages = min(2, doc.page_count)  # first 1–2 pages is usually enough (speed)
+                text = "\n".join(doc[i].get_text("text") or "" for i in range(pages))
+        elif name.endswith(".docx"):
+            from docx import Document
+            bio = io.BytesIO(file_bytes)
+            doc = Document(bio)
+            text = "\n".join(p.text for p in doc.paragraphs)
+        else:
+            text = file_bytes.decode("utf-8", "ignore")
+    except Exception:
+        text = file_bytes.decode("utf-8", "ignore")
+
+    # Contacts
+    email = re.search(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', text or "")
+    phone = re.search(r'(\+?\d[\d\-\s\(\)]{7,}\d)', text or "")
+    email = email.group(0) if email else ""
+    phone = phone.group(0) if phone else ""
+
+    # First non-empty non-header line as name guess
+    guessed_name = ""
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s: continue
+        if email and email in s: continue
+        if phone and phone in s: continue
+        if re.search(r"resume|curriculum vitae|contact", s, re.I): continue
+        guessed_name = s[:80]
+        break
+
+    toks = re.findall(r"[A-Za-z][A-Za-z0-9\+\.\-#]{1,}", (text or "").lower())
+    skills = sorted({t for t in toks if t in SKILL_LEXICON})[:10]   # cap to keep prompts small
+    roles  = sorted({t for t in toks if t in ROLE_LEXICON})[:4]
+
+    return {
+        "hash": file_hash,
+        "text": text[:6000],   # truncate for speed
+        "name": guessed_name,
+        "email": email,
+        "phone": phone,
+        "skills": skills,
+        "roles": roles,
+    }
+
+# --------------------------- Direct Ollama call (fast) ---------------------------
+def ollama_generate(prompt: str, system: str = "", model: str = None,
+                    num_ctx: int = NUM_CTX, num_predict: int = NUM_PRED, temperature: float = TEMP, timeout=45) -> str:
+    """Direct /api/generate call to Ollama (no LangChain)."""
+    base = OLLAMA
+    model = model or MODEL
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "system": system or "",
+        "stream": False,
+        "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": temperature}
+    }
+    r = requests.post(f"{base}/api/generate", json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("response") or "").strip()
+
+# --------------------------- CSUSB internship scraper ---------------------------
+BAD_LAST = {"careers","career","jobs","job","students","graduates","early-careers"}
+JUNK_KEYWORDS = {
+    "proposal form","evaluation form","student evaluation","supervisor evaluation",
+    "report form","handbook","resume","cv","scholarship","scholarships","grant program",
+    "career center","advising","policy","forms","pdf"
+}
+
+def _clean(s: str) -> str:
+    return re.sub(r"\s+"," ", (s or "")).strip()
+
+def _path_is_specific(path: str) -> bool:
+    p = (path or "/").lower()
+    if "intern" in p or "co-op" in p: return True
+    seg = [s for s in p.split("/") if s]
+    if any(re.search(r"\d{5,}", s) for s in seg): return True
+    if seg and seg[-1] in BAD_LAST: return False
+    return len(seg) >= 3
+
+def _is_intern_link(text, url) -> bool:
+    low = f"{text} {url}".lower()
+    if any(k in low for k in JUNK_KEYWORDS): return False
+    if not ("intern" in low or "co-op" in low): return False
+    try:
+        return _path_is_specific(urlparse(url).path)
+    except Exception:
+        return False
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def scrape_csusb() -> pd.DataFrame:
+    try:
+        r = requests.get(CSUSB_URL, headers={"User-Agent": UA}, timeout=20)
+        r.raise_for_status()
+    except Exception:
+        return pd.DataFrame()
+    soup = BeautifulSoup(r.text, "lxml")
     main = soup.find("main") or soup
     rows, seen = [], set()
     for a in main.find_all("a", href=True):
-        t = re.sub(r"\s+"," ", a.get_text(" ", strip=True))
+        t = _clean(a.get_text(" ", strip=True))
         if not t: continue
         absu = urljoin(CSUSB_URL, a["href"])
         k = (t.lower(), absu)
         if k in seen: continue
-        if not _is_internish(t + " " + absu):  # keep only obviously internship-ish
-            continue
-        host = _host(absu)
+        if not _is_intern_link(t, absu): continue
+        host = urlparse(absu).netloc.lower()
         comp = host.split(".")[-2].capitalize() if host else ""
-        rows.append({"title": t, "company_guess": comp, "link": absu, "host": host})
+        rows.append({"title": t, "company": comp, "link": absu})
         seen.add(k)
-    return rows
+    return pd.DataFrame(rows)
 
-def collect_postings_from_portal(root_url: str, limit=MAX_POSTINGS_PER_PORTAL) -> list[dict]:
-    """
-    Heuristic deep-scrape for common portals using requests+bs4 (no JS).
-    We only keep detail pages that look like job postings AND contain 'intern' text.
-    """
-    out, seen = [], set()
+# --------------------------- Job page helpers (cached) ---------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_job_text(url: str, limit: int = 5000) -> str:
     try:
-        html = _read_url(root_url)
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+        if r.status_code != 200: return ""
+        s = BeautifulSoup(r.text, "lxml")
+        main = s.find("main") or s.find("article") or s.find("section") or s
+        return (main.get_text(" ", strip=True) or "")[:limit]
     except Exception:
-        return out
-    soup = _soup(html)
-    base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(root_url))
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        absu = urljoin(base, href)
-        p = urlparse(absu).path
-        text = a.get_text(" ", strip=True)
-        if not _is_internish(text + " " + absu):
-            continue
-        if not _job_like_path(p):
-            continue
-        key = absu.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"title": text or "Internship", "link": absu})
-        if len(out) >= limit:
-            break
-    # If we found nothing, also consider the full page text and look for A tags with internish in URL alone
-    if not out:
-        for a in soup.find_all("a", href=True):
-            absu = urljoin(base, a["href"])
-            if "intern" in absu.lower() and _job_like_path(urlparse(absu).path):
-                key = absu.lower()
-                if key in seen: continue
-                seen.add(key)
-                out.append({"title": a.get_text(" ", strip=True) or "Internship", "link": absu})
-                if len(out) >= limit: break
-    return out
+        return ""
 
-@st.cache_data(ttl=60*20, show_spinner=False)
-def deep_collect_postings() -> pd.DataFrame:
+def infer_company_from_url(url: str) -> str:
+    try:
+        host = urlparse(url).netloc
+        parts = [p for p in host.split(".") if p not in {"www","jobs","careers","boards","gh","lever","greenhouse"}]
+        if not parts: return ""
+        return parts[-2].capitalize() if len(parts) >= 2 else parts[-1].capitalize()
+    except Exception:
+        return ""
+
+def infer_role_from_text(txt: str) -> str:
+    m = re.search(r"(?i)\b(software|data|machine learning|ml|ai|security|cloud|devops).{0,40}intern", txt or "")
+    if m:
+        start = max(0, m.start()-30); end = min(len(txt), m.end()+30)
+        seg = re.sub(r"\s+", " ", (txt or "")[start:end])
+        mm = re.search(r"([A-Z][A-Za-z0-9\-\s]{2,60}Intern)", seg)
+        if mm: return mm.group(1).strip()
+    m2 = re.search(r"(?i)(?:title|position)\s*[:\-]\s*([^\n\r]+)", txt or "")
+    return (m2.group(1).strip() if m2 else "")
+
+# --------------------------- LLM-only cover letter (fast) ---------------------------
+def draft_cover_letter(company: str, role: str, job_url: str, job_text: str, who: dict, profile: dict) -> str:
     """
-    1) Get internship-ish outbound links from CSUSB page.
-    2) For each link:
-       - If it's a well-known job portal root/listing, collect individual internship postings.
-       - Else if it already looks like a posting, keep it.
+    LLM-only cover letter (no hardcoded fallback).
+    - Uses ONLY facts from résumé parsing + job snippet.
+    - 140–180 words, 3 short paragraphs.
+    - No placeholders, no invented facts.
     """
-    sources = scrape_csusb_links()
-    all_rows, total = [], 0
-    for src in sources:
-        url = src["link"]
-        plat = _platform_of(url)
-        # If already looks like a posting (detail page), keep it directly
-        if _job_like_path(urlparse(url).path) and _is_internish(url):
-            all_rows.append({
-                "title": src["title"],
-                "company": src["company_guess"],
-                "link": url,
-                "platform": plat,
-                "source": CSUSB_URL,
-                "posted": datetime.utcnow().date().isoformat(),
-                "blob": _canon(f"{src['title']} {src['company_guess']} {url} {plat}")
-            })
-            total += 1
-            if total >= MAX_TOTAL_POSTINGS: break
-            continue
+    nm = (who.get("name") or "").strip()
+    # Title-case to avoid ALL CAPS names while preserving Mixed Case tokens
+    name = " ".join([w.capitalize() if w.isupper() or w.islower() else w for w in nm.split()]) or "Candidate"
+    company = (company or "").strip() or "your team"
+    email = (who.get("email") or "").strip()
+    phone = (who.get("phone") or "").strip()
+    linkedin = (who.get("linkedin") or "").strip()
 
-        # If it's a known portal, follow it and pull detail postings
-        if plat in PLATFORMS:
-            # follow only a few unique portal roots to avoid hammering
-            postings = collect_postings_from_portal(url, limit=MAX_POSTINGS_PER_PORTAL)
-            for p in postings:
-                all_rows.append({
-                    "title": p["title"],
-                    "company": src["company_guess"] or urlparse(p["link"]).netloc.split(".")[-2].capitalize(),
-                    "link": p["link"],
-                    "platform": plat,
-                    "source": url,
-                    "posted": datetime.utcnow().date().isoformat(),
-                    "blob": _canon(f"{p['title']} {src['company_guess']} {p['link']} {plat}")
-                })
-                total += 1
-                if total >= MAX_TOTAL_POSTINGS: break
-        # else: ignore generic pages (not detail)
+    roles  = ", ".join((profile.get("roles") or [])[:4])
+    skills = ", ".join((profile.get("skills") or [])[:10])
 
-        if total >= MAX_TOTAL_POSTINGS:
-            break
+    snippet = re.sub(r"\s+", " ", (job_text or ""))[:800]
 
-    # Deduplicate by link
-    if not all_rows:
-        return pd.DataFrame(columns=["title","company","link","platform","source","posted","blob"])
-    df = pd.DataFrame(all_rows).drop_duplicates(subset=["link"]).reset_index(drop=True)
-    return df
-
-# -------------------- Matching & scoring --------------------
-def score_posting(row, profile, company_pref, location, remote):
-    score = 0
-    blob = row.get("blob","")
-    for r in (profile or {}).get("roles", []):
-        if _canon(r) in blob: score += 3
-    for s in (profile or {}).get("skills", []):
-        if _canon(s) in blob: score += 2
-    if company_pref and _canon(company_pref) in blob: score += 4
-    if location and _canon(location) in blob: score += 1
-    if remote and remote.lower()!="any" and _canon(remote) in blob: score += 1
-    return score
-
-def filter_rank(df, profile, query_text: str):
-    if df.empty: return df
-    q = (query_text or "").strip().lower()
-    comp_tok = None
-    if "intern" in q:
-        # crude company token extraction: last non-generic word before 'intern'
-        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9\-\.]{1,}", q)
-        for i, t in enumerate(tokens):
-            if "intern" in t.lower() and i > 0:
-                comp_tok = tokens[i-1]
-                break
-
-    # textual filter by query
-    if comp_tok:
-        tok = _canon(comp_tok)
-        df = df[df["blob"].str.contains(tok, na=False)]
-        if df.empty:
-            return df
-
-    # score and rank
-    df = df.copy()
-    df["match_score"] = df.apply(lambda r: score_posting(r, profile, comp_tok, None, "any"), axis=1)
-    df = df.sort_values(["match_score","posted"], ascending=[False, False])
-    return df
-
-# -------------------- Application Kit --------------------
-def build_application_kit(posting, profile, who):
     prompt = f"""
-You are an internship application assistant. Create succinct, professional materials.
+You are an expert career writer. Produce a SHORT, specific, truthful cover letter grounded ONLY in the facts below.
+If a detail is missing, omit it—never invent it.
 
-POSTING:
-- Title: {posting.get('title','')}
-- Company: {posting.get('company','')}
-- URL: {posting.get('link','')}
+FACTS:
+- Name: {name}
+- Email: {email or '—'}
+- Phone: {phone or '—'}
+- LinkedIn: {linkedin or '—'}
+- Roles: {roles or '—'}
+- Skills: {skills or '—'}
+- Company: {company}
+- Role: {role or 'Intern'}
+- Job URL: {job_url or '—'}
+- Job snippet: {snippet or '—'}
 
-CANDIDATE:
-- Name: {who.get('name') or '—'}
-- Email: {who.get('email') or '—'}
-- Phone: {who.get('phone') or '—'}
-- LinkedIn: {who.get('linkedin') or '—'}
-- Roles: {', '.join(profile.get('roles') or []) or '—'}
-- Skills: {', '.join(profile.get('skills') or []) or '—'}
-- Experience (years): {profile.get('exp_years') or '—'}
+STRICT RULES:
+- 140–180 words, 3 short paragraphs.
+- First sentence must name {company} and the {role or 'intern'} role.
+- Tie 3–4 skills to the snippet, ONLY from the facts above.
+- Do NOT mention years of experience or past employers unless present in facts.
+- No placeholders like [Company] or [Your Name].
+- Close with availability and contact (email/LinkedIn if present).
+- Start with "Dear {company}" or "Dear Hiring Team at {company}".
+- End with a signature block including the real candidate name: {name}.
 
-Deliver exactly these sections:
-1) Email Subject (one line)
-2) Email Body (6–10 concise lines; include the posting title, link, and contact details)
-3) Cover Note (one tight paragraph 90–130 words)
-4) ATS Keywords (comma-separated, 12–20 items)
-5) Resume Bullets (3–5 quantified bullets)
+Return ONLY the letter text.
 """
-    out = llm_answer(prompt, sys_msg="Be specific, accurate, concise, professional.") or \
-          "(LLM unavailable) Draft your own email, short cover, ATS keywords, and 3 bullets using top skills."
-    txt = f"""=== APPLICATION KIT ===
-Company: {posting.get('company','')}
-Role: {posting.get('title','')}
-Link: {posting.get('link','')}
+    system = "Follow the rules exactly. Be concise, warm, and honest. Do not invent facts."
+    letter = ollama_generate(prompt, system, MODEL, NUM_CTX, NUM_PRED, TEMP)
+    # light cleanup
+    return re.sub(r"\[[^\]]*\]", "", letter).strip() if letter else ""
 
-{out}
-"""
-    return out, txt
+# --------------------------- Streamlit UI ---------------------------
+st.set_page_config(page_title="CSUSB Internships + Cover Letter (fast)", page_icon="💼", layout="wide")
+st.title("💼 CSUSB Internships + ✉️ Cover Letter (fast, LLM-only)")
 
-# -------------------- UI --------------------
-st.set_page_config(page_title="CSUSB Internship Assistant", page_icon="💬", layout="wide")
-st.title("💬 CSUSB Internship Assistant")
-st.caption("Greet → general chat • say “internships” to list (deep scrape to posting pages) • say “apply for internships” to personalize, upload résumé, generate Application Kits, and Auto-Apply (Greenhouse/Lever).")
-
-# Session state init
+# Session state
 for k, v in {
     "mode": "greet",
-    "llm_ready": ollama_ready(OLLAMA),
-    "interview_active": False,
-    "interview_idx": 0,
-    "interview_answers": {},
-    "applicant_info": None,
-    "profile": None,
-    "results_df": None,
-    "selected": set(),
+    "wizard_step": 0,
+    "resume_parsed": {},
+    "job_url": "",
+    "company": "",
+    "role": "",
+    "name": "",
+    "email": "",
+    "phone": "",
+    "linkedin": "",
+    "role_hint": "",
+    "skills_hint": "",
 }.items():
-    if k not in st.session_state: st.session_state[k] = v
+    st.session_state.setdefault(k, v)
 
-# Greet
+# -------- Simple Q&A (greet) --------
 if st.session_state["mode"] == "greet":
-    st.markdown("**Hi! How can I help you today?**")
-    user = st.text_input("Type here (e.g., 'Amazon internships', 'Apply for internships', or any question) 👇")
-    if not user:
-        st.stop()
-    txt = user.lower()
+    st.subheader("Ask me something")
+    user = st.text_input("Try: 'hi', 'what is this', 'show internships', or 'cover letter' 👇")
 
-    # Route: apply
-    if re.search(r"\b(apply|application|apply for)\b.*\b(intern|internship)", txt) or txt.strip() in {"apply", "apply for internships"}:
-        st.session_state["interview_active"] = True
-        st.session_state["interview_idx"] = 0
-        st.session_state["interview_answers"] = {}
-        st.session_state["mode"] = "apply"
-        st.rerun()
-
-    # Route: list/search
-    if "intern" in txt:
-        with st.spinner("Deep-scraping internship postings…"):
-            df = deep_collect_postings()
-        if df.empty:
-            st.warning("No internship postings found right now.")
+    if user:
+        t = user.strip().lower()
+        if re.search(r'^(hi|hello|hey)\b', t):
+            st.markdown("**Assistant:** Hi! I can list internships and write a cover letter from a job link using your résumé.")
+            if st.button("Start Cover Letter Wizard ✍️"):
+                st.session_state["mode"] = "cover_wizard"
+                st.session_state["wizard_step"] = 0
+                st.rerun()
+        elif "what is this" in t or "about" in t:
+            st.markdown("**Assistant:** I fetch internship links from the CSUSB CSE page and create tailored cover letters using your résumé.")
+        elif re.search(r'\bcover\s*letter\b', t):
+            st.session_state["mode"] = "cover_wizard"; st.session_state["wizard_step"] = 0; st.rerun()
+        elif re.search(r'\b(show\s+internships?|list\s+internships?|internships?)\b', t):
+            st.session_state["mode"] = "list"; st.rerun()
         else:
-            # filter & rank w/ minimal profile (none yet)
-            df2 = filter_rank(df, None, user)
-            st.session_state["results_df"] = df2
-            st.session_state["mode"] = "list"
-            st.rerun()
+            # quick single-turn LLM answer (optional)
+            try:
+                ans = ollama_generate(user, "Answer concisely in 2–5 sentences.")
+            except Exception:
+                ans = "I'm here! Try 'show internships' or 'cover letter'."
+            st.markdown("**Assistant:** " + (ans or "Try 'show internships' or 'cover letter'."))
 
-    # General Q&A
-    ans = llm_answer(user) if st.session_state["llm_ready"] else ""
-    if not ans:
-        ans = rule_based_answer(user)
-    st.markdown("**Assistant:** " + ans)
-    st.stop()
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Show Internships 🔎"):
+            st.session_state["mode"] = "list"; st.rerun()
+    with col2:
+        if st.button("Cover Letter Wizard ✍️"):
+            st.session_state["mode"] = "cover_wizard"; st.session_state["wizard_step"] = 0; st.rerun()
 
-# List results (from greet search or manual)
+# -------- Show internships --------
 if st.session_state["mode"] == "list":
-    st.subheader("🔎 Internship Postings (deep-scraped)")
-    df = st.session_state.get("results_df")
-    if df is None:
-        with st.spinner("Deep-scraping internship postings…"):
-            df = deep_collect_postings()
-        st.session_state["results_df"] = df
-    if df is None or df.empty:
-        st.warning("No internship postings found at the moment.")
+    st.subheader("🔎 Internships from CSUSB – Internships & Careers")
+    with st.spinner("Fetching internships…"):
+        df = scrape_csusb()
+    if df.empty:
+        st.warning("No internship postings found on the CSUSB page right now.")
     else:
-        view = df[["title","company","platform","link","posted"]].reset_index(drop=True)
-        st.dataframe(view, use_container_width=True, hide_index=True)
-        st.caption("Tip: Use the “Apply for internships” flow to personalize, upload résumé, rank, generate kits, and auto-apply.")
-
+        st.dataframe(df, use_container_width=True, hide_index=True)
     if st.button("Back ↩️"):
         st.session_state["mode"] = "greet"; st.rerun()
+    st.markdown("---")
+    st.caption("Want a cover letter for a specific job? Go back and pick **Cover Letter Wizard**.")
 
-# Apply flow (interview -> form -> rank -> kits -> auto-apply)
-if st.session_state["mode"] == "apply":
-    # 1) Interview
-    if st.session_state.get("interview_active", False):
-        idx = st.session_state.get("interview_idx", 0)
-        if idx < len(INTERVIEW_QUESTIONS):
-            key, qtext = INTERVIEW_QUESTIONS[idx]
-            st.subheader("🧭 Internship Application – Quick Questions")
-            st.write(f"**{idx+1}/{len(INTERVIEW_QUESTIONS)}**  {qtext}")
-            ans = st.text_input("Your answer:", key=f"interview_{key}")
-            c1, c2 = st.columns(2)
-            if c1.button("Next ➡️"):
-                st.session_state["interview_answers"][key] = ans
-                st.session_state["interview_idx"] = idx + 1
-                st.rerun()
-            if c2.button("Skip"):
-                st.session_state["interview_answers"][key] = ""
-                st.session_state["interview_idx"] = idx + 1
-                st.rerun()
-            st.stop()
-        else:
-            # finish interview
-            A = st.session_state.get("interview_answers", {})
-            st.session_state["profile"] = merge_interview_into_profile(A)
-            st.session_state["interview_active"] = False
-            st.success("Thanks! I used your answers to prefill your preferences below.")
+# -------- Cover letter wizard (resume → autofill → letter) --------
+if st.session_state["mode"] == "cover_wizard":
+    st.subheader("✉️ Cover Letter Wizard (uses your résumé)")
+    step = st.session_state["wizard_step"]
 
-    # 2) Application form
-    st.subheader("📄 Your Info & Preferences")
-    with st.form("apply_form", clear_on_submit=False):
+    def next_step():
+        st.session_state["wizard_step"] += 1
+        st.rerun()
+
+    def prev_step():
+        st.session_state["wizard_step"] = max(0, st.session_state["wizard_step"] - 1)
+        st.rerun()
+
+    # Step 0: Upload résumé (cached parse)
+    if step == 0:
+        st.write("**Step 1/4 — Upload your résumé** (PDF/DOCX/TXT). I’ll extract your name, email, phone, and skills.")
+        new_file = st.file_uploader("Upload résumé", type=["pdf","docx","txt"], key="resume_upload")
+        if new_file is not None:
+            data = new_file.getvalue()
+            parsed = extract_resume_fast(data, new_file.name)
+            st.session_state["resume_parsed"] = parsed
+            # prefill UI fields
+            st.session_state["name"]  = parsed.get("name","")
+            st.session_state["email"] = parsed.get("email","")
+            st.session_state["phone"] = parsed.get("phone","")
+            st.session_state["role_hint"]  = ", ".join(parsed.get("roles", []))
+            st.session_state["skills_hint"]= ", ".join(parsed.get("skills", []))
+            st.success("Résumé parsed (cached).")
+        cols = st.columns(2)
+        if cols[0].button("Next ➡️", disabled=not st.session_state["resume_parsed"]):
+            next_step()
+        if cols[1].button("Back ↩️"):
+            st.session_state["mode"] = "greet"; st.rerun()
+
+    # Step 1: Job link
+    elif step == 1:
+        st.write("**Step 2/4 — Paste the job posting link** (Lever/Greenhouse/company careers).")
+        st.session_state["job_url"] = st.text_input("Job URL (required)", value=st.session_state["job_url"])
+        cols = st.columns(3)
+        if cols[0].button("⬅️ Previous"):
+            prev_step()
+        if cols[2].button("Next ➡️", disabled=not bool(st.session_state["job_url"].strip())):
+            next_step()
+
+    # Step 2: Review auto-filled info (you can edit)
+    elif step == 2:
+        st.write("**Step 3/4 — Review your info** (auto-filled; you may edit).")
         c1, c2 = st.columns(2)
         with c1:
-            name  = st.text_input("Your name")
-            email = st.text_input("Email")
-            phone = st.text_input("Phone")
+            st.session_state["name"]  = st.text_input("Your name", value=st.session_state["name"])
+            st.session_state["email"] = st.text_input("Email", value=st.session_state["email"])
+            st.session_state["phone"] = st.text_input("Phone", value=st.session_state["phone"])
         with c2:
-            linkedin = st.text_input("LinkedIn URL")
-            location = st.text_input("Preferred location (optional)")
-            remote   = st.selectbox("Remote type", ["Any","Remote","Hybrid","Onsite"], index=0)
+            st.session_state["linkedin"]   = st.text_input("LinkedIn URL", value=st.session_state["linkedin"])
+            st.session_state["role_hint"]  = st.text_input("Desired role(s)", value=st.session_state["role_hint"])
+            st.session_state["skills_hint"]= st.text_input("Top skills (comma-separated)", value=st.session_state["skills_hint"])
+        cols = st.columns(3)
+        if cols[0].button("⬅️ Previous"):
+            prev_step()
+        if cols[2].button("Next ➡️"):
+            next_step()
 
-        pref_company = st.text_input("Preferred company (optional)")
-        role_hint    = st.text_input("Desired role(s) (e.g., software, data, security)",
-                                     value=", ".join(st.session_state.get("profile",{}).get("roles",[])))
-        skills_hint  = st.text_input("Top skills (comma-separated)",
-                                     value=", ".join(st.session_state.get("profile",{}).get("skills",[])))
-        resume       = st.file_uploader("Upload résumé (PDF, DOCX, or TXT)", type=["pdf","docx","txt"])
+    # Step 3: Generate & show letter
+    elif step == 3:
+        st.write("**Step 4/4 — Generate Cover Letter**")
 
-        submitted = st.form_submit_button("Find & Rank Internships 🔍")
+        # Fetch job text and infer company/role
+        job_url = st.session_state["job_url"]
+        job_text = fetch_job_text(job_url)
+        company  = infer_company_from_url(job_url)
+        role     = infer_role_from_text(job_text)
 
-    # 3) Ranking
-    ranked = None
-    if submitted:
-        resume_text = extract_text_from_upload(resume)
-        prof = resume_to_profile(resume_text, role_hint, skills_hint)
-        st.session_state["profile"] = prof
-        with st.spinner("Deep-scraping internship postings…"):
-            df = deep_collect_postings()
-        if df.empty:
-            st.warning("No internship postings found.")
-        else:
-            df2 = df.copy()
-            # simple textual company filter first if provided
-            if pref_company:
-                df2 = df2[df2["blob"].str.contains(_canon(pref_company), na=False)]
-                if df2.empty:
-                    df2 = df.copy()  # fallback
-            # rank
-            df2["match_score"] = df2.apply(lambda r: score_posting(r, prof, pref_company, location, remote), axis=1)
-            df2 = df2.sort_values(["match_score","posted"], ascending=[False, False]).reset_index(drop=True)
-            ranked = df2.head(30)
-            st.session_state["results_df"] = ranked
+        # Build profile from parsed résumé + user edits
+        parsed = st.session_state.get("resume_parsed", {})
+        roles  = parsed.get("roles", [])[:4]
+        skills = parsed.get("skills", [])[:10]
+        if st.session_state["role_hint"]:
+            for t in re.split(r"[,/; ]+", st.session_state["role_hint"].lower()):
+                t=t.strip()
+                if t and t not in roles: roles.append(t)
+        if st.session_state["skills_hint"]:
+            for t in re.split(r"[,/; ]+", st.session_state["skills_hint"].lower()):
+                t=t.strip()
+                if t and t not in skills: skills.append(t)
+        profile = {"roles": roles, "skills": skills}
 
-    df = st.session_state.get("results_df")
-    if df is not None and not df.empty:
-        st.subheader("🎯 Best Matches")
-        st.caption("Select internships you want to apply to, then generate Application Kits or Auto-Apply (Greenhouse/Lever).")
-        picks = []
-        for i, r in df.iterrows():
-            key = f"pick_{i}"
-            with st.expander(f"{i+1}. {r['title']} — {r.get('company','')} ({r.get('platform','')})"):
-                st.write(f"[Open posting / Apply]({r['link']})")
-                chosen = st.checkbox("Select this internship", key=key, value=False)
-                if chosen:
-                    picks.append(r.to_dict())
+        who = {
+            "name": st.session_state["name"],
+            "email": st.session_state["email"],
+            "phone": st.session_state["phone"],
+            "linkedin": st.session_state["linkedin"]
+        }
 
-        # 4) Application Kits
-        if st.button("Generate Application Kits"):
-            who = {
-                "name": name, "email": email, "phone": phone, "linkedin": linkedin
-            }
-            prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
-            if not picks:
-                st.warning("Select at least one internship above.")
-            else:
-                for item in picks:
-                    kit_md, kit_txt = build_application_kit(item, prof, who)
-                    st.markdown(f"**Application Kit – {item.get('title')} @ {item.get('company','')}**")
-                    st.markdown(kit_md or "_(Enable Ollama for richer kits.)_")
-                    st.download_button(
-                        label=f"⬇️ Download Kit ({item.get('company','')[:18]} – {item.get('title','')[:26]})",
-                        data=kit_txt.encode("utf-8"),
-                        file_name=f"application_kit_{_canon(item.get('company',''))}_{_canon(item.get('title',''))}.txt",
-                        mime="text/plain"
-                    )
+        # Generate (LLM-only)
+        with st.form("gen_cover"):
+            st.write("Ready to generate?")
+            submitted = st.form_submit_button("Generate Cover Letter ✍️")
+            if submitted:
+                try:
+                    letter = draft_cover_letter(company, role, job_url, job_text, who, profile)
+                except Exception as e:
+                    letter = ""
+                    st.error(f"LLM call failed: {e}")
 
-        # 5) Auto-Apply
-        st.markdown("---")
-        st.subheader("⚡ Auto-Apply (beta) — Greenhouse & Lever only")
-        st.caption("Fills common fields (name, email, phone, résumé, cover note). Other portals will be marked 'manual_required'.")
-        resume_for_auto = st.file_uploader("Upload résumé for auto-apply (PDF preferred)", type=["pdf"], key="resume_for_auto")
-        if st.button("Auto-apply to selected"):
-            if not picks:
-                st.warning("Select at least one internship above.")
-                st.stop()
-            if not resume_for_auto:
-                st.warning("Please upload your resume (PDF) for auto-apply.")
-                st.stop()
-            who = {"name": name, "email": email, "phone": phone, "linkedin": linkedin}
-            prof = st.session_state.get("profile") or {"roles":[],"skills":[],"exp_years":None}
-            cover = llm_answer(
-                f"Write a concise 6–8 line cover letter for internships. Roles={prof.get('roles')}, "
-                f"skills={prof.get('skills')}. Mention eagerness to learn and link to LinkedIn: {linkedin}.",
-                sys_msg="Professional, succinct tone."
-            ) or (
-                f"Dear Hiring Team,\n\n"
-                f"I am excited to apply for internship roles. My background includes {', '.join(prof.get('skills')[:6])} "
-                f"and interests in {', '.join(prof.get('roles')[:3])}. I am eager to contribute and learn.\n"
-                f"LinkedIn: {linkedin}\n\n"
-                f"Thank you for your consideration.\n"
-                f"{name}\n{email}\n{phone}"
-            )
-            with st.spinner("Submitting applications…"):
-                results = asyncio.run(auto_apply_batch(picks, who, resume_for_auto.read(), cover))
-            st.success("Auto-apply finished. Review statuses below.")
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
-            st.markdown(
-                "Legend: **submitted_or_attempted** = form filled & submit click attempted • "
-                "**manual_required** = unsupported portal; open link and apply manually."
-            )
+                if not letter:
+                    st.error("The LLM returned an empty response. Ensure Ollama is running and the model is available (e.g., `ollama pull llama3.2:3b`).")
+                else:
+                    st.markdown("### Your Cover Letter")
+                    st.text_area("Preview", value=letter, height=280)
+                    fname = f"cover_letter_{re.sub(r'[^a-z0-9]+','_', (company or 'company').lower())}_" \
+                            f"{re.sub(r'[^a-z0-9]+','_', (role or 'intern').lower())}.txt"
+                    st.download_button("⬇️ Download Cover Letter", data=letter.encode("utf-8"),
+                                       file_name=fname, mime="text/plain")
 
-    if st.button("Back ↩️"):
-        st.session_state["mode"] = "greet"
-        st.session_state["results_df"] = None
-        st.rerun()
+        cols = st.columns(3)
+        if cols[0].button("⬅️ Start Over"):
+            st.session_state["wizard_step"] = 0; st.rerun()
+        if cols[2].button("Back to Home"):
+            st.session_state["mode"] = "greet"; st.rerun()
