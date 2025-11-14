@@ -1,6 +1,262 @@
-body,[data-testid="stAppViewContainer"]{
-  font-family:Inter,system-ui,sans-serif;
-  background:#f8fafc;
-  color:#111827;
+/* ---- base variables + google font ---- */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root{
+  --bg:#f8fafc;
+  --bg-elev:#ffffff;
+  --card:#f1f5f9;
+  --text:#111827;
+  --muted:#4b5563;
+  --accent:#2563eb;
+  --accent-2:#16a34a;
+
+  --font:"Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --sidebar:#ffffff;
+  --input-bar:#f9fafb;
+  --user-bubble:#dbeafe;
+  --bot-bubble:#f1f5f9;
+  --panel:#ffffff;
+  --bubble-shadow:0 1px 0 #0001 inset, 0 8px 20px #0001;
+
+  --radius:14px;
+  --shadow:0 10px 30px rgba(0,0,0,.08);
 }
-#MainMenu,footer{visibility:hidden}
+
+html, body, [data-testid="stAppViewContainer"] {
+  font-family: var(--font);
+  color: var(--text);
+  background:
+    radial-gradient(1000px 600px at 30% -10%, #93c5fd22, transparent 60%),
+    radial-gradient(800px 400px at 100% 10%, #bfdbfe22, transparent 60%),
+    linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+}
+
+/* (optional) reinforce */
+.stApp{ background:var(--bg) !important; color:var(--text) !important; }
+
+/* hide default Streamlit chrome */
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] > div{
+  background:var(--sidebar) !important;
+  border-radius:24px !important;
+  margin:12px;
+  padding-top:8px;
+  box-shadow:var(--bubble-shadow);
+  border:1px solid rgba(255,255,255,.06);
+}
+
+/* Inputs */
+.stTextInput, .stSelectbox, .stMultiSelect, .stTextArea{
+  border-radius:18px !important;
+  background:var(--input-bar) !important;
+  color:var(--text) !important;
+  border:1px solid rgba(255,255,255,.08);
+}
+
+/* Buttons */
+.stButton > button{
+  border-radius:9999px !important;
+  border:0;
+  padding:.6rem 1.1rem;
+  font-weight:600;
+  color:white;
+  background:linear-gradient(90deg, #5B8DEF, #A0B8FF);
+  box-shadow:0 6px 14px rgba(91,141,239,.25);
+  transition:transform .06s ease, box-shadow .2s ease, opacity .2s ease;
+}
+.stButton > button:hover{ transform:translateY(-1px); }
+.stButton > button:active{ transform:translateY(0); opacity:.95; }
+
+/* Chat input bar */
+[data-testid="stChatInput"]{
+  background: var(--input-bar);
+  border: 1px solid #ffffff12;
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+[data-testid="stChatInput"] > div{ background: transparent !important; }
+
+/* composer input itself */
+textarea[data-baseweb="textarea"]{
+  background: transparent !important;
+  color:#111827 !important;
+  font-size: 15px !important;
+}
+
+/* send button (Streamlit secondary button) */
+button[kind="secondary"]{
+  background:linear-gradient(180deg,#3b82f6,#2563eb) !important;
+  border:1px solid #2563eb33 !important;
+  color: #fff !important;
+  border-radius: 10px !important;
+}
+
+/* message rows */
+[data-testid="stChatMessage"]{ margin: 14px 0; }
+
+/* remove avatar + fix padding */
+[data-testid="stChatMessageAvatar"]{ display:none !important; }
+[data-testid="stChatMessage"] > div:first-child{ padding-left:0 !important; }
+
+/* bubble wrapper */
+[data-testid="stChatMessageContent"]{
+  border: 1px solid rgba(255,255,255,.08);
+  background: var(--bot-bubble);
+  border-radius: 18px;
+  box-shadow: var(--bubble-shadow);
+  padding: 14px 16px;
+}
+
+/* role chip */
+.stChatMessage .role-chip{
+  display:inline-block; font-size:11px; letter-spacing:.04em; text-transform:uppercase;
+  color: var(--muted); border:1px solid #ffffff22; padding:2px 6px; border-radius:999px;
+  background: var(--bg-elev); margin-bottom:6px;
+}
+
+/* Distinguish user bubbles using the chip we render in Python */
+.stChatMessage:has(.role-chip.user) [data-testid="stChatMessageContent"]{
+  background: var(--user-bubble);
+  border-color:#5670ff33;
+}
+
+/* Text inside bubbles */
+[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p{ margin:0; }
+
+/* Links */
+a{ color:#5B8DEF !important; text-decoration:none; }
+a:hover{ text-decoration:underline; }
+
+/* system notes */
+.system-note{
+  font-size:13px; color:var(--muted); font-style:italic;
+  border-left:3px solid #ffffff1a; padding-left:10px; margin-top:6px;
+}
+.link-pill{
+  display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #ffffff1a;
+  margin:6px 6px 0 0; font-size:13px; color:#cbd5e1; text-decoration:none;
+}
+.link-pill:hover{ border-color:#ffffff33; }
+
+/* Tables / cards */
+.stDataFrame, .stAlert, .stMetric, .stContainer{
+  border-radius:18px !important;
+  box-shadow:var(--bubble-shadow);
+  background:var(--panel) !important;
+  border:1px solid rgba(255,255,255,.06);
+}
+
+/* kill any leftover avatar container just in case */
+.stChatMessage [data-testid="stChatMessageAvatar"],
+.stChatMessage [aria-label="chat message avatar"],
+.stChatMessage img[alt="avatar"] { display:none !important; }
+
+/* center the content column and give breathing room */
+[data-testid="stAppViewContainer"] > .main {
+  max-width: 980px; margin: 0 auto; padding: 24px 24px 96px;
+}
+
+/* header spacing + weight */
+h1 { letter-spacing:.2px; }
+
+/* make the composer stick to the bottom with a frosted look */
+[data-testid="stChatInput"]{
+  position: sticky; bottom: 16px; z-index: 5;
+  backdrop-filter: blur(6px);
+}
+
+[data-testid="stChatMessageContent"]{
+  background: var(--bot-bubble);
+  color: var(--text);
+  border: 1px solid #e5e7eb;
+}
+
+.stChatMessage:has(.role-chip.user) [data-testid="stChatMessageContent"]{
+  background: var(--user-bubble);
+  border-color:#bfdbfe;
+}
+
+.role-chip{
+  font-size: 10px; letter-spacing:.08em; opacity:.85;
+  padding: 2px 8px; border-radius: 999px;
+}
+
+/* typing indicator (three bouncing dots) */
+.typing{display:flex; gap:6px; align-items:center; height:10px}
+.typing span{width:6px;height:6px;border-radius:50%;background:#ffffff66;display:inline-block;animation:tdots 1.2s infinite}
+.typing span:nth-child(2){animation-delay:.15s}
+.typing span:nth-child(3){animation-delay:.3s}
+@keyframes tdots{0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)}} 
+
+[data-testid="stChatMessageContent"]{
+  border-radius:18px;
+  background:var(--bot-bubble);
+  border:1px solid #e5e7eb;
+  box-shadow:0 2px 6px rgba(0,0,0,.04);
+}
+
+.stChatMessage:has(.role-chip.user) [data-testid="stChatMessageContent"]{
+  background: var(--user-bubble);
+  border-color:#bfdbfe;
+  box-shadow:0 2px 6px rgba(37,99,235,.08);
+}
+
+[data-testid="stChatMessage"] + [data-testid="stChatMessage"] {
+  margin-top: 10px;
+  border-top: 1px solid #f1f5f9;
+  padding-top: 10px;
+}
+
+[data-testid="stChatInput"]{
+  border:1px solid #d1d5db;
+  background:#ffffff;
+  box-shadow:0 1px 3px rgba(0,0,0,.05);
+}
+
+#resume-fab [data-testid="stPopoverButton"] > button{
+  width:46px; height:46px; border-radius:999px;
+  background: linear-gradient(180deg,#3b82f6,#2563eb) !important;
+  color:#fff !important; font-weight:700; font-size:22px; border:0;
+  box-shadow: 0 10px 30px rgba(0,0,0,.08);
+}
+
+/* === Center the chat input and keep it narrow === */
+
+
+
+
+/* === Lock chat composer size/position (always small + centered) === */
+:root { --composer-max: 680px; }
+
+div[data-testid="stChatInput"] {
+  position: fixed !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+  bottom: 16px !important;
+  z-index: 1000 !important;
+
+  width: var(--composer-max) !important;
+  max-width: calc(100% - 48px) !important;
+
+  margin: 0 auto !important;
+  background: #fff !important;
+  border: 1px solid #d1d5db !important;
+  border-radius: 12px !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,.05) !important;
+}
+
+/* Make inner input respect the fixed width */
+div[data-testid="stChatInput"] > div { width: 100% !important; }
+
+/* Keep page content above the fixed composer */
+[data-testid="stAppViewContainer"] > .main { padding-bottom: 140px !important; }
+
+/* Left “+” proxy spacing so text doesn’t overlap */
+[data-testid="stChatInput"] textarea,
+[data-testid="stChatInput"] input,
+[data-testid="stChatInput"] [contenteditable="true"]{
+  padding-left: 56px !important;
+}
